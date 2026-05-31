@@ -1,0 +1,8 @@
+build/
+IMPLEMENTATION_PLAN*
+tests/__pycache__
+*.ll
+initial_*.json
+.idea/
+*.trace
+tests/*.ll

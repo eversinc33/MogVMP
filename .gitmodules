@@ -1,0 +1,6 @@
+[submodule "remill"]
+	path = remill
+	url = https://github.com/lifting-bits/remill
+[submodule "zydis"]
+	path = zydis
+	url = https://github.com/zyantific/zydis.git

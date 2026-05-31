@@ -1,0 +1,87 @@
+﻿cl : command line  warning D9002: ignoring unknown option '/FP:strict'
+  MyPinTool.cpp
+C:\pin\source\include\pin\gen\pinsync.hpp(105,1): warning C5208: unnamed class used in typedef name cannot declare members other than non-static data members, member enumerations, or member classes
+  (compiling source file 'MyPinTool.cpp')
+  
+C:\pin\source\include\pin\gen\pinsync.hpp(238,1): warning C5208: unnamed class used in typedef name cannot declare members other than non-static data members, member enumerations, or member classes
+  (compiling source file 'MyPinTool.cpp')
+  
+C:\pin\source\include\pin\gen\pinsync.hpp(842,1): warning C5208: unnamed class used in typedef name cannot declare members other than non-static data members, member enumerations, or member classes
+  (compiling source file 'MyPinTool.cpp')
+  
+     Creating library C:\pin\source\tools\MyPinTool\Debug\MyPinTool.lib and object C:\pin\source\tools\MyPinTool\Debug\MyPinTool.exp
+crtbeginS.obj : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+MyPinTool.obj : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(ms_dllcrt.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(message.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(util.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(knob.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(lock.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(ins_api_xed_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(pin_client.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(image.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(symbol_win.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(util_windows.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(version.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(sysfuncs_windows.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(stat.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(reg_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(reg_partial_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(bbl.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(ins.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(comment.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(ins_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(ins_syscall_ia32_windows.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(operand_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(ins_inits_api_xed_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(ins_xed_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(rel.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(bigarray.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(parser.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(base_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(exception.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(stripe.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(ext.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(calling_standard_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(vmtool.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(thread_client.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(debugger_client.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(opin_client.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(tls_client.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(child_process_client.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(internal_exception_client.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(pin_jit.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(image_win.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(aoti.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(complexlock.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(rtn.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(app.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(sec.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(img.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(sym.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(symbol_elf.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(edg.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(sm_dbginfo.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(sm_ipc.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(sm_client.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(util_unicode_windows.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(cpu_info_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(chunk.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(cfg.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(ins_map_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(val.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(ins_reuse_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(flags_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(tool_mmap.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(regset_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(probe_config.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(child_process.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(elf_parser.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(follow_child_win_probe.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(dll_load_win_probe.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(modules_win.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(elf_windows.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(cfg_ia32.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+pin.lib(reg.cpp.obj) : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+crtbeginS.obj : warning LNK4210: .CRT section exists; there may be unhandled static initializers or terminators
+  MyPinTool.vcxproj -> C:\pin\source\tools\MyPinTool\Debug\MyPinTool.dll
