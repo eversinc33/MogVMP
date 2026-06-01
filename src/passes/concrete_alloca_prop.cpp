@@ -613,24 +613,6 @@ ProgramState transfer_block(
 
         if (auto *cb = llvm::dyn_cast<llvm::CallBase>(&inst))
         {
-            if (auto *ia = llvm::dyn_cast<llvm::InlineAsm>(cb->getCalledOperand()))
-            {
-                if (ia->getAsmString() == "rdtsc")
-                {
-                    // TODO: HACK: we stub out rdtsc because its just anti analysis noise.
-                    auto *ty = llvm::cast<llvm::StructType>(cb->getType());
-                    auto *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(bb.getContext()), 0);
-                    auto *agg = llvm::ConstantStruct::get(ty, {zero, zero});
-                    if (rewrite)
-                    {
-                        inst.replaceAllUsesWith(agg);
-                        erase.push_back(&inst);
-                        ++changed;
-                    }
-                }
-                continue;
-            }
-
             auto *callee = cb->getCalledFunction();
             if (!callee)
                 continue;

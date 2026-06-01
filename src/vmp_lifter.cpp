@@ -47,6 +47,7 @@
 #include "passes/concrete_alloca_prop.h"
 #include "passes/readable_block_names.h"
 #include "passes/readable_register_names.h"
+#include "passes/strip_rdtsc_sideeffects.h"
 
 //==---------------------------------------------------------------------------==//
 // VmBlock
@@ -990,6 +991,13 @@ static void run_freeze_cleanup(llvm::Module &module)
     cleanup.addPass(llvm::ADCEPass());
     cleanup.addPass(llvm::SimplifyCFGPass());
     helpers::run_function_pipeline_on_module(module, std::move(cleanup));
+}
+
+static void run_strip_rdtsc_sideeffects(llvm::Module &module)
+{
+    llvm::ModulePassManager mpm;
+    mpm.addPass(StripRdtscSideEffectsPass());
+    helpers::run_module_pipeline(module, std::move(mpm));
 }
 
 static llvm::FunctionPassManager build_handler_local_cleanup_pipeline()
@@ -2083,8 +2091,13 @@ std::unique_ptr<llvm::Module> LiftingContext::execute(llvm::ArrayRef<uint64_t> r
     if (save_intermediate)
         dump_module_snapshot(*out_module, "out.after_concrete_prop.ll");
 
+    // RDTSC only produces EDX:EAX. Remill's sideeffect inline asm blocks DCE of
+    // VMProtect junk timestamp reads, so normalize those calls before final O3.
+    run_strip_rdtsc_sideeffects(*out_module);
+
     // Final optimization
     helpers::run_default_o3_pipeline(*out_module);
+    run_strip_rdtsc_sideeffects(*out_module);
     if (save_intermediate)
         dump_module_snapshot(*out_module, "out.after_final_o3.ll");
 

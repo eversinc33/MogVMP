@@ -28,7 +28,8 @@ add_executable(lifter
   src/peload.cpp
   src/passes/concrete_alloca_prop.cpp
   src/passes/readable_register_names.cpp
-  src/passes/readable_block_names.cpp)
+  src/passes/readable_block_names.cpp
+  src/passes/strip_rdtsc_sideeffects.cpp)
 
 target_link_libraries(lifter PRIVATE remill Zydis::Zydis)
 
