@@ -100,3 +100,7 @@ std::optional<unsigned> InstructionDecoder::push_register_index(const DecodedIns
         default: return std::nullopt;
     }
 }
+bool InstructionDecoder::is_indirect_jmp(const std::optional<DecodedInstruction>::value_type &inst)
+{
+    return inst.mnemonic == ZYDIS_MNEMONIC_JMP && inst.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER;
+}

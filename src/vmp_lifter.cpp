@@ -307,6 +307,11 @@ static bool looks_like_vmexit_restore_handler(const Memory &memory, uint64_t add
                 ++scanned;
                 continue;
             }
+            if (InstructionDecoder::is_indirect_jmp(*inst))
+            {
+                // Terminate if it has an indirect jmp, then its not vmexit
+                break;
+            }
             if (InstructionDecoder::is_pop(*inst))
                 ++pops;
             if (InstructionDecoder::is_ret(*inst))

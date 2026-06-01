@@ -4,15 +4,22 @@
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/ScalarEvolution.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/IR/CFG.h>
+#include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DataLayout.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 #include <llvm/Support/Casting.h>
+#include <llvm/TargetParser/Triple.h>
 
 #include <cstdint>
 #include <optional>
@@ -203,6 +210,80 @@ std::optional<unsigned> find_domain_index_for_ptr(
     return std::nullopt;
 }
 
+// Maps each store whose pointer is a non-constant offset into a domain alloca to
+// the [lo, hi) byte range it can touch, when that range is provably bounded.
+// Stores absent from the map have an unknown range and must be treated as a
+// whole-domain clobber.
+using BoundedStoreRanges = llvm::DenseMap<llvm::StoreInst *, std::pair<uint64_t, uint64_t>>;
+
+// Use ScalarEvolution to bound the byte range of strided (loop-induction) stores
+// into a domain alloca. VMProtect leans on REP MOVS / context copies whose
+// destination index is an affine IV; without a bound the dataflow pass clobbers
+// the entire 4 GiB domain, erasing facts (e.g. the next-handler EIP word) that
+// the copy provably does not overlap. A bounded range lets us invalidate only the
+// touched bytes. Anything we cannot bound is left out of the map (full clobber).
+void compute_bounded_store_ranges(
+    llvm::Function &fn, llvm::ArrayRef<ConcreteAllocaDomain> domains, const llvm::DataLayout &dl,
+    BoundedStoreRanges &out
+)
+{
+    // Cap the range we are willing to materialize as explicit unknown facts; an
+    // enormous bound is no better than a full clobber and would bloat the maps.
+    constexpr uint64_t kMaxRangeBytes = 1u << 16;
+
+    llvm::DominatorTree         dt(fn);
+    llvm::LoopInfo              li(dt);
+    llvm::AssumptionCache       ac(fn);
+    llvm::TargetLibraryInfoImpl tlii{llvm::Triple(fn.getParent()->getTargetTriple())};
+    llvm::TargetLibraryInfo     tli(tlii);
+    llvm::ScalarEvolution       se(fn, tli, ac, dt, li);
+
+    for (auto &bb : fn)
+    {
+        for (auto &inst : bb)
+        {
+            auto *si = llvm::dyn_cast<llvm::StoreInst>(&inst);
+            if (!si)
+                continue;
+            llvm::Value *ptr = si->getPointerOperand();
+
+            // Constant-offset stores are already handled precisely; only the
+            // non-constant ones into a domain alloca need bounding.
+            uint64_t const_off = 0;
+            if (find_domain_index_for_ptr(ptr, domains, dl, const_off))
+                continue;
+            auto base_domain = find_domain_base_for_ptr(ptr, domains);
+            if (!base_domain)
+                continue;
+
+            // Offset (in bytes) of the store pointer relative to the alloca base.
+            const llvm::SCEV *off_scev =
+                se.getMinusSCEV(se.getSCEV(ptr), se.getSCEV(domains[*base_domain].alloca));
+            if (llvm::isa<llvm::SCEVCouldNotCompute>(off_scev))
+                continue;
+
+            llvm::ConstantRange range = se.getUnsignedRange(off_scev);
+            if (range.isFullSet() || range.isWrappedSet())
+                continue;
+
+            llvm::APInt min_off = range.getUnsignedMin();
+            llvm::APInt max_off = range.getUnsignedMax();
+            if (min_off.getActiveBits() > 64 || max_off.getActiveBits() > 64)
+                continue;
+
+            uint64_t width = dl.getTypeStoreSize(si->getValueOperand()->getType());
+            if (!width)
+                continue;
+            uint64_t lo = min_off.getZExtValue();
+            uint64_t hi = max_off.getZExtValue() + width;  // exclusive
+            if (hi <= lo || hi - lo > kMaxRangeBytes)
+                continue;
+
+            out[si] = {lo, hi};
+        }
+    }
+}
+
 bool same_state(const ProgramState &a, const ProgramState &b)
 {
     if (a.size() != b.size())
@@ -369,7 +450,8 @@ ProgramState transfer_block(
     llvm::BasicBlock &bb, ProgramState state, llvm::ArrayRef<ConcreteAllocaDomain> domains, const llvm::DataLayout &dl,
     bool little_endian, bool rewrite, unsigned &changed,
     llvm::SmallVectorImpl<llvm::BasicBlock *> *known_successors = nullptr,
-    llvm::SmallVectorImpl<SymFact>            *persistent_sym_facts = nullptr
+    llvm::SmallVectorImpl<SymFact>            *persistent_sym_facts = nullptr,
+    const BoundedStoreRanges                  *bounded_store_ranges = nullptr
 )
 {
     llvm::SmallVector<llvm::Instruction *, 32>         erase;
@@ -463,13 +545,29 @@ ProgramState transfer_block(
             {
                 if (auto base_domain = find_domain_base_for_ptr(si->getPointerOperand(), domains))
                 {
+                    unsigned d = static_cast<unsigned>(*base_domain);
                     // A store through a non-constant GEP may alias any previously
                     // tracked byte/symbolic fact in this alloca.  Keeping old facts
                     // here is unsound; VMProtect uses computed VM-stack addresses
                     // heavily, and stale forwarded facts can change program semantics.
-                    state[*base_domain].facts.clear();
-                    state[*base_domain].default_valid = false;
-                    kill_domain_sym(static_cast<unsigned>(*base_domain));
+                    // When ScalarEvolution could bound the strided store to a byte
+                    // range, invalidate only that range (keeping default_valid and
+                    // every fact outside it) instead of clobbering the whole domain.
+                    auto range_it = bounded_store_ranges ? bounded_store_ranges->find(si)
+                                                          : BoundedStoreRanges::const_iterator{};
+                    if (bounded_store_ranges && range_it != bounded_store_ranges->end())
+                    {
+                        auto [lo, hi] = range_it->second;
+                        for (uint64_t o = lo; o < hi; ++o)
+                            state[d].facts[o] = -1;
+                        kill_sym(d, lo, hi - lo);
+                    }
+                    else
+                    {
+                        state[d].facts.clear();
+                        state[d].default_valid = false;
+                        kill_domain_sym(d);
+                    }
                 }
                 continue;
             }
@@ -743,6 +841,14 @@ unsigned propagate_concrete_alloca_constants(
     const auto &dl = fn.getParent()->getDataLayout();
     const bool  little_endian = dl.isLittleEndian();
 
+    // Bound strided (induction-variable) stores so they invalidate only the bytes
+    // they can touch instead of the whole domain. Computed once on the original IR;
+    // the store keys survive the rewrite phase (stores are never folded away here),
+    // and any store whose index later folds to a constant is handled by the precise
+    // constant-offset path before the clobber branch is reached.
+    BoundedStoreRanges bounded_store_ranges;
+    compute_bounded_store_ranges(fn, domains, dl, bounded_store_ranges);
+
     llvm::DenseMap<llvm::BasicBlock *, ProgramState>                       in_state;
     llvm::DenseMap<llvm::BasicBlock *, ProgramState>                       out_state;
     llvm::DenseSet<llvm::BasicBlock *>                                     executable_blocks;
@@ -766,7 +872,8 @@ unsigned propagate_concrete_alloca_constants(
             unsigned                                 dummy_changed = 0;
             llvm::SmallVector<llvm::BasicBlock *, 2> known_successors;
             ProgramState                             out =
-                transfer_block(bb, in, domains, dl, little_endian, /*rewrite=*/false, dummy_changed, &known_successors);
+                transfer_block(bb, in, domains, dl, little_endian, /*rewrite=*/false, dummy_changed, &known_successors,
+                               /*persistent_sym_facts=*/nullptr, &bounded_store_ranges);
 
             auto old_in = in_state.find(&bb);
             if (old_in == in_state.end() || !same_state(old_in->second, in))
@@ -793,7 +900,8 @@ unsigned propagate_concrete_alloca_constants(
             continue;
         auto         it = in_state.find(&bb);
         ProgramState in = (it == in_state.end()) ? empty : it->second;
-        (void)transfer_block(bb, in, domains, dl, little_endian, /*rewrite=*/true, changed);
+        (void)transfer_block(bb, in, domains, dl, little_endian, /*rewrite=*/true, changed,
+                             /*known_successors=*/nullptr, /*persistent_sym_facts=*/nullptr, &bounded_store_ranges);
     }
 
     // After CFG cleanup the devirt function often becomes a single straight-line
@@ -815,7 +923,8 @@ unsigned propagate_concrete_alloca_constants(
         llvm::SmallVector<SymFact, 32> linear_sym_facts;
         for (auto &bb : fn)
             linear = transfer_block(
-                bb, linear, domains, dl, little_endian, /*rewrite=*/true, changed, nullptr, &linear_sym_facts
+                bb, linear, domains, dl, little_endian, /*rewrite=*/true, changed, nullptr, &linear_sym_facts,
+                &bounded_store_ranges
             );
     }
 

@@ -26,7 +26,8 @@ public:
     static bool                              is_direct_call(const DecodedInstruction &inst);
     static bool                              is_pop(const DecodedInstruction &inst);
     static std::optional<unsigned>           push_register_index(const DecodedInstruction &inst);
+    static bool                              is_indirect_jmp(const std::optional<DecodedInstruction>::value_type& inst);
 
-private:
+   private:
     static const ZydisDecoder &x86_decoder();
 };
