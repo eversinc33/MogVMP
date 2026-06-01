@@ -64,7 +64,7 @@ ctest --test-dir build --output-on-failure
 ### Shoutouts
 
 * [Ryan Weil](https://ryan-weil.github.io/), who happened to work on a similar project, for great discussions
-* phage, for motivation, telling me VMP 3.5 was an easy target
+* [Kyle Elliott](https://github.com/kyle-elliott-tob), for motivation, telling me VMP 3.5 was an easy target
 * bakki, for giving the project its name:
 
 <p align="center">
