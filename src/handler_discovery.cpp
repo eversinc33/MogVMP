@@ -13,7 +13,6 @@
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 
-#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -708,8 +707,7 @@ std::optional<VmpBranchInfo> detect_vmp_branch(llvm::Function &fn, const Memory 
 PrefixResult DiscoveryEngine::run_step(
     const PrefixDiscoveryBuilder           &build_prefix,
     std::optional<std::pair<unsigned, bool>> forced_branch_condition,
-    bool                                     full_concretize,
-    bool                                     dump_probe
+    bool                                     full_concretize
 )
 {
     unsigned          step = step_counter_++;
@@ -721,8 +719,6 @@ PrefixResult DiscoveryEngine::run_step(
              forced_branch_condition, full_concretize);
     if (save_intermediate_)
         dump_function_snapshot(*fn, "out.prefix." + std::to_string(step) + ".after.ll");
-    else if (dump_probe && std::getenv("VMP_DUMP_VMEXIT"))
-        dump_function_snapshot(*fn, "out.vmexit." + std::to_string(step) + ".after.ll");
 
     if (auto c = get_constant_i32_return(*fn))
     {

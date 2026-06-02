@@ -31,18 +31,6 @@ struct VmpTrace
     uint64_t image_base = 0;  // Optional runtime image base (--imagebase).
 };
 
-// One --continue entry: where to resume after a VMEXIT, plus an optional explicit
-// call target for that exit when the VM computes it as base+RVA (which doesn't
-// fold to a constant in the prefix probe, e.g. an internal sub_XXXX call). When
-// call_target is 0 the call is auto-resolved from the exit EIP (import thunks do
-// fold). Syntax: "reentry" or "call@reentry".
-struct ContinueEntry
-{
-    uint64_t reentry = 0;
-    uint64_t call_target = 0;  // 0 = auto-resolve from the exit EIP
-    unsigned call_argc = 0;    // stack args for this exit's call (0 = none/known)
-};
-
 class VmpLifter
 {
    public:
@@ -51,9 +39,12 @@ class VmpLifter
     // Targets x86-32/Windows only. Returns a LiftResult (falsy on failure).
     // param_count: number of symbolic function arguments. Pass std::nullopt to
     // infer it from the `push <reg>` sequence ahead of the VMENTER call.
+    // continue_vmentries: VMENTER addresses of the VMs reached after each VMEXIT,
+    // in order. When non-empty the lifter follows VMEXITs (emitting the external
+    // call the VM exited to) and resumes at the next listed VM; empty means lift a
+    // single VM and stop at its first VMEXIT.
     LiftResult run(
         const Memory &memory, const PEInfo &pe_info, VmpTrace trace, std::optional<unsigned> param_count,
-        bool save_intermediate = false, bool follow_vmexit = false,
-        llvm::ArrayRef<ContinueEntry> continue_vmentries = {}, llvm::ArrayRef<uint64_t> replay_handlers = {}
+        bool save_intermediate = false, llvm::ArrayRef<uint64_t> continue_vmentries = {}
     );
 };

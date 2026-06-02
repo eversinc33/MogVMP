@@ -1186,8 +1186,12 @@ struct LiftingContext
     VmpTrace                          trace;
     unsigned                          param_count;
     bool                              save_intermediate;
+    // True when the user supplied continuation VMs (--continue): the lifter follows
+    // each VMEXIT, emits the external call, and resumes at the next listed VM.
+    // Derived from continue_vmentries; also gates the ESP-window snapshot machinery
+    // (capture/seed), which must stay off the plain single-VM discovery path.
     bool                              follow_vmexit;
-    std::vector<ContinueEntry>        continue_vmentries;
+    std::vector<uint64_t>             continue_vmentries;  // next-VM VMENTER addrs, in order
     uint32_t                          host_return_address;
     std::vector<HostRegisterBinding>  host_reg_bindings;
 
@@ -1209,8 +1213,7 @@ struct LiftingContext
         VmpTrace                             trace,
         unsigned                             param_count,
         bool                                 save_intermediate,
-        bool                                 follow_vmexit,
-        std::vector<ContinueEntry>           continue_vmentries,
+        std::vector<uint64_t>                continue_vmentries,
         uint32_t                             host_return_address,
         std::vector<HostRegisterBinding>     host_reg_bindings
     )
@@ -1226,7 +1229,7 @@ struct LiftingContext
         , trace(trace)
         , param_count(param_count)
         , save_intermediate(save_intermediate)
-        , follow_vmexit(follow_vmexit)
+        , follow_vmexit(!continue_vmentries.empty())
         , continue_vmentries(std::move(continue_vmentries))
         , host_return_address(host_return_address)
         , host_reg_bindings(std::move(host_reg_bindings))
@@ -1235,7 +1238,7 @@ struct LiftingContext
         manager.lift_set.insert(trace.vmenter);
     }
 
-    std::unique_ptr<llvm::Module> execute(llvm::ArrayRef<uint64_t> replay_handlers);
+    std::unique_ptr<llvm::Module> execute();
 
     void            prepare_lifted_handler(uint64_t handler_addr);
     void            lift_handler(uint64_t addr);
@@ -2013,8 +2016,7 @@ bool LiftingContext::discover_block(
         while (true)
         {
             // we want to fully concretize the prefix, so that the next iteration can benefit from the whole state snapshot
-            result = discovery.run_step(build_prefix, arm_force, /*full_concretize=*/true,
-                                        /*dump_probe=*/is_vmexit_restore);
+            result = discovery.run_step(build_prefix, arm_force, /*full_concretize=*/true);
 
             bool retry_full_prefix = false; // fallback to full prefix if the result is bogus or unknown
             if (used_cached_snapshot)
@@ -2050,19 +2052,11 @@ bool LiftingContext::discover_block(
 
             if (is_vmexit_restore)
             {
-                // Resolve the call the VM exits to. Imports arrive as an original-thunk
-                // value (e.g. 0x13142 -> GetTickCount) and fold to a constant; an
-                // internal base+RVA target (e.g. sub_401000) does not fold, so it can
-                // be supplied via the --continue entry's call_target.
+                // Resolve the call the VM exits to from the exit EIP: import thunks
+                // (e.g. 0x13142 -> GetTickCount) and in-image targets (sub_XXXX) both
+                // fold to a constant and auto-resolve; internal targets get an opaque
+                // call with an auto-recovered argument count.
                 std::optional<ExternalCall> ext = follow_vmexit ? resolve_external_call(pe_info, next) : std::nullopt;
-                if (follow_vmexit && continue_cursor < continue_vmentries.size())
-                {
-                    const ContinueEntry &peek = continue_vmentries[continue_cursor];
-                    if (!ext && peek.call_target)
-                        ext = resolve_external_call(pe_info, static_cast<uint32_t>(peek.call_target));
-                    if (ext && peek.call_argc)
-                        ext->argc = peek.call_argc;  // user-supplied arg count override
-                }
                 if (follow_vmexit)
                 {
                     std::cout << "[*] follow-vmexit @0x" << std::hex << current_addr << ": EIP=0x" << next;
@@ -2078,7 +2072,7 @@ bool LiftingContext::discover_block(
                 // the terminal exit (the external call, if any, is still emitted).
                 if (follow_vmexit && continue_cursor < continue_vmentries.size())
                 {
-                    uint64_t next_vm = continue_vmentries[continue_cursor++].reentry;
+                    uint64_t next_vm = continue_vmentries[continue_cursor++];
                     std::cout << "[*] follow-vmexit: continuing at next VM 0x" << std::hex << next_vm << std::dec
                               << " (" << continue_cursor << "/" << continue_vmentries.size() << ")\n";
                     // Patch this VM entry's non-returning dispatcher call NOW (not up
@@ -2151,30 +2145,16 @@ bool LiftingContext::discover_block(
         {
             if (continue_cursor < continue_vmentries.size())
             {
-                const ContinueEntry &entry = continue_vmentries[continue_cursor++];
-                // The exit EIP didn't fold; use the entry's explicit call target if given.
-                std::optional<ExternalCall> ext;
-                if (entry.call_target)
-                {
-                    ext = resolve_external_call(pe_info, static_cast<uint32_t>(entry.call_target));
-                    if (ext && entry.call_argc)
-                    {
-                        ext->argc       = entry.call_argc;  // explicit override wins
-                        ext->infer_argc = false;
-                    }
-                }
+                // The exit EIP didn't fold to a call target, so emit no external call;
+                // just resume at the next queued VM.
+                uint64_t next_vm = continue_vmentries[continue_cursor++];
                 std::cout << "[*] follow-vmexit @0x" << std::hex << current_addr
-                          << ": exit target unresolved; continuing at next VM 0x" << entry.reentry << std::dec
-                          << " (" << continue_cursor << "/" << continue_vmentries.size() << ")";
-                if (ext)
-                    std::cout << " [call " << ext->symbol << (ext->internal ? " (internal)" : "") << "]";
-                std::cout << "\n";
-                if (ext)
-                    block.external_call = ext;  // opaque (imports + internal both)
+                          << ": exit target unresolved; continuing at next VM 0x" << next_vm << std::dec
+                          << " (" << continue_cursor << "/" << continue_vmentries.size() << ")\n";
                 unsigned patched = 0;
-                patched_memory = patch_nonreturn_vmentry_calls(patched_memory, entry.reentry, &patched);
+                patched_memory = patch_nonreturn_vmentry_calls(patched_memory, next_vm, &patched);
                 block.next = std::make_unique<VmBlock>();
-                return discover_block(*block.next, entry.reentry, {}, std::nullopt, std::nullopt);
+                return discover_block(*block.next, next_vm, {}, std::nullopt, std::nullopt);
             }
             std::cout << "[*] follow-vmexit @0x" << std::hex << current_addr
                       << ": terminal VM exit (no further continuation)" << std::dec << "\n";
@@ -2190,19 +2170,8 @@ bool LiftingContext::discover_block(
     return false;
 }
 
-std::unique_ptr<llvm::Module> LiftingContext::execute(llvm::ArrayRef<uint64_t> replay_handlers)
+std::unique_ptr<llvm::Module> LiftingContext::execute()
 {
-    if (follow_vmexit)
-    {
-        std::cout << "[*] follow-vmexit: PE sections:\n";
-        for (const auto &s : pe_info.sections)
-            std::cout << "      " << s.name << "  [0x" << std::hex << (pe_info.image_base + s.rva)
-                      << ", 0x" << (pe_info.image_base + s.rva + s.virt_size) << ")" << std::dec
-                      << (peload::IsInVmpSection(pe_info, pe_info.image_base + s.rva) ? "  <vmp>" : "") << "\n";
-        std::cout << "[*] follow-vmexit: parsed " << std::dec << pe_info.import_by_slot_rva.size()
-                  << " import slot(s)\n";
-    }
-
     // Setup remill intrinsics and normalize functions
     setup_remill_intrinsics(*sem_module);
     neutralize_dispatch_intrinsics(*sem_module);
@@ -2210,32 +2179,11 @@ std::unique_ptr<llvm::Module> LiftingContext::execute(llvm::ArrayRef<uint64_t> r
     stub_and_inline_flag_compare_helpers(*sem_module);
 
     // -----------------------------------------------------------------------
-    // Build root VmBlock
+    // Discovery: lift handlers one by one starting at the VMENTER and fork on
+    // branch, following VMEXITs into the continuation VMs when --continue is set.
     auto root_block = std::make_unique<VmBlock>();
-    bool recovered_to_vmexit = false;
-
-    // Replay mode - build a flat linear VmBlock from the replay list
-    if (!replay_handlers.empty())
-    {
-        std::vector<uint64_t> replay_trace;
-        if (replay_handlers.front() != trace.vmenter)
-            replay_trace.push_back(trace.vmenter);
-        replay_trace.insert(replay_trace.end(), replay_handlers.begin(), replay_handlers.end());
-
-        std::cout << "[*] Replaying " << std::dec << replay_trace.size() << " trace entries; skipping discovery\n";
-        for (uint64_t addr : replay_trace)
-            lift_handler(addr);
-
-        root_block->handlers  = replay_trace;
-        root_block->at_vmexit = true;
-        recovered_to_vmexit   = true;
-    }
-    else
-    {
-        // Discovery mode - lift handlers one by one and fork on branch
-        std::cout << "[*] Starting handler discovery at 0x" << std::hex << trace.vmenter << std::dec << "\n";
-        recovered_to_vmexit = discover_block(*root_block, trace.vmenter, {}, std::nullopt, std::nullopt);
-    }
+    std::cout << "[*] Starting handler discovery at 0x" << std::hex << trace.vmenter << std::dec << "\n";
+    bool recovered_to_vmexit = discover_block(*root_block, trace.vmenter, {}, std::nullopt, std::nullopt);
 
     if (!recovered_to_vmexit)
         std::cerr << "[!] Failed to recover a complete trace to VMEXIT; emitting partially devirtualized IR\n";
@@ -2449,8 +2397,7 @@ std::unique_ptr<llvm::Module> LiftingContext::execute(llvm::ArrayRef<uint64_t> r
 
 LiftResult VmpLifter::run(
     const Memory &memory, const PEInfo &pe_info, VmpTrace trace, std::optional<unsigned> param_count,
-    bool save_intermediate, bool follow_vmexit, llvm::ArrayRef<ContinueEntry> continue_vmentries,
-    llvm::ArrayRef<uint64_t> replay_handlers
+    bool save_intermediate, llvm::ArrayRef<uint64_t> continue_vmentries
 )
 {
     auto  ctx_owned = std::make_unique<llvm::LLVMContext>();
@@ -2506,11 +2453,11 @@ LiftResult VmpLifter::run(
     
     LiftingContext lifting_context(
         ctx, memory, pe_info, std::move(arch), std::move(sem_module), std::move(patched_memory),
-        std::move(vm), trace, resolved_param_count, save_intermediate, follow_vmexit,
-        std::vector<ContinueEntry>(continue_vmentries.begin(), continue_vmentries.end()),
+        std::move(vm), trace, resolved_param_count, save_intermediate,
+        std::vector<uint64_t>(continue_vmentries.begin(), continue_vmentries.end()),
         host_return_address, std::move(host_reg_bindings)
     );
 
-    auto out_module = lifting_context.execute(replay_handlers);
+    auto out_module = lifting_context.execute();
     return LiftResult{std::move(ctx_owned), std::move(out_module)};
 }

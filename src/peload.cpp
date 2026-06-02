@@ -48,7 +48,7 @@ static std::string ReadCStr(const Memory &memory, uint64_t addr, size_t max_len 
     return s;
 }
 
-// Parse the import directory (data dir index 1) into info.import_by_slot_rva.
+// Parse the import directory (data dir index 1) into info.import_by_orig_thunk.
 // Best-effort: silently leaves the map empty when the table is absent or mangled
 // (VMProtect often rebuilds it); callers then fall back to opaque-by-address.
 static void ParseImports(const Memory &memory, PEInfo &info, uint32_t import_rva)
@@ -89,8 +89,7 @@ static void ParseImports(const Memory &memory, PEInfo &info, uint32_t import_rva
                 // thunk = RVA to IMAGE_IMPORT_BY_NAME { uint16 hint; char name[]; }
                 imp.symbol = ReadCStr(memory, base + (thunk & 0x7fffffffu) + 2);
             }
-            info.import_by_orig_thunk[thunk] = imp;
-            info.import_by_slot_rva[iat_rva + i * 4] = std::move(imp);
+            info.import_by_orig_thunk[thunk] = std::move(imp);
         }
     }
 }
@@ -310,12 +309,6 @@ const PESection *SectionOf(const PEInfo &info, uint64_t addr)
         if (rva >= s.rva && rva < static_cast<uint64_t>(s.rva) + s.virt_size)
             return &s;
     return nullptr;
-}
-
-bool IsInVmpSection(const PEInfo &info, uint64_t addr)
-{
-    const PESection *s = SectionOf(info, addr);
-    return s && s->name.rfind(".vmp", 0) == 0;
 }
 
 const PEImport *ImportByThunk(const PEInfo &info, uint32_t thunk_value)

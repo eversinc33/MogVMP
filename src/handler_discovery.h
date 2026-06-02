@@ -80,8 +80,7 @@ public:
     PrefixResult run_step(
         const PrefixDiscoveryBuilder           &build_prefix,
         std::optional<std::pair<unsigned, bool>> forced_branch_condition = std::nullopt,
-        bool                                     full_concretize = false,
-        bool                                     dump_probe = false
+        bool                                     full_concretize = false
     );
 
 private:
