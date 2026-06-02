@@ -343,17 +343,13 @@ static Memory patch_nonreturn_vmentry_calls(const Memory &memory, uint64_t vment
 
 /**
  * Heuristically identify a vmexit handler by counting the number of pop instructions - if more
- * than 6, it is likely a vmexit
+ * than 6, it is likely a vmexit. This routine follows direct jumps
  * @param memory
  * @param addr
  * @return
  */
 static bool looks_like_vmexit_restore_handler(const Memory &memory, uint64_t addr)
 {
-    // The guest-register restore (POPAD-style) does many pops and ends in a `ret`
-    // into the native epilogue. VMProtect splits it across several obfuscated
-    // blocks linked by unconditional jmps, so follow that jmp chain (not just one
-    // hop), accumulating pops, until the terminating `ret`.
     unsigned                     pops = 0;
     bool                         has_ret = false;
     std::unordered_set<uint64_t> seen_blocks;
@@ -595,18 +591,6 @@ static unsigned erase_unused_undefined8_calls(llvm::Module &module)
     return unused.size();
 }
 
-// Recover the real argument count of infer_argc external calls (emitted as
-// varargs with a provisional upper bound of kInferArgcProbe slots) and rebuild
-// each call with just the genuine arguments.
-//
-// A VMEXIT-to-call leaves the pushed arguments contiguous just above the return
-// address at [ESP+4 ..]; the slots beyond them are the caller's existing frame,
-// which begins with a saved return address (a pointer into an executable image
-// section). After concretization every probed slot has folded to a constant or a
-// computed SSA value, so the boundary is the first constant operand (past the
-// first) that points into an executable section. That return-address sentinel is
-// the end of the argument list (rwx9's "stack slots with reaching defs": only the
-// freshly-pushed slots are arguments).
 static unsigned trim_inferred_call_args(llvm::Function &fn, const PEInfo &pe_info)
 {
     auto is_exec_ptr = [&pe_info](llvm::Value *v) -> bool
@@ -618,6 +602,7 @@ static unsigned trim_inferred_call_args(llvm::Function &fn, const PEInfo &pe_inf
         return s && (s->characteristics & 0x20000000u);  // IMAGE_SCN_MEM_EXECUTE
     };
 
+    // A VMEXIT call transition leaves the arguments above the return address, so we probe for a pointer to the PE memory and then extract the arguments
     llvm::SmallVector<llvm::CallInst *, 8> targets;
     for (auto &bb : fn)
         for (auto &inst : bb)
@@ -633,7 +618,7 @@ static unsigned trim_inferred_call_args(llvm::Function &fn, const PEInfo &pe_inf
         for (unsigned i = 1; i < ci->arg_size(); ++i)
             if (is_exec_ptr(ci->getArgOperand(i)))
             {
-                argc = i;  // saved return address -> end of the argument list
+                argc = i;  // saved return address == end of the argument list
                 break;
             }
         if (argc == ci->arg_size())
@@ -733,11 +718,11 @@ static unsigned materialize_branch_vsp_constants(llvm::Function &fn, const VmBlo
     unsigned changed = 0;
     auto    *i32Ty = llvm::Type::getInt32Ty(fn.getContext());
 
-    std::cerr << "[DBG] materialize_branch_vsp_constants: " << branches.size() << " branch(es)\n";
+    //std::cerr << "[DBG] materialize_branch_vsp_constants: " << branches.size() << " branch(es)\n";
     for (const auto &branch : branches)
     {
-        std::cerr << "[DBG]   branch vsp_taken=0x" << std::hex << branch.vsp_taken
-                  << " vsp_fall=0x" << branch.vsp_fall << std::dec << "\n";
+        //std::cerr << "[DBG]   branch vsp_taken=0x" << std::hex << branch.vsp_taken
+        //          << " vsp_fall=0x" << branch.vsp_fall << std::dec << "\n";
         llvm::BasicBlock *taken_bb = nullptr;
         llvm::BasicBlock *fall_bb = nullptr;
         for (auto &bb : fn)
@@ -749,8 +734,8 @@ static unsigned materialize_branch_vsp_constants(llvm::Function &fn, const VmBlo
         }
         if (!taken_bb || !fall_bb)
         {
-            std::cerr << "[DBG]   taken_bb=" << (void *)taken_bb << " fall_bb=" << (void *)fall_bb
-                      << " (one missing, skipping)\n";
+            //std::cerr << "[DBG]   taken_bb=" << (void *)taken_bb << " fall_bb=" << (void *)fall_bb
+            //          << " (one missing, skipping)\n";
             continue;
         }
 
@@ -772,8 +757,8 @@ static unsigned materialize_branch_vsp_constants(llvm::Function &fn, const VmBlo
                 if (!((op0_taken && op1_fall) || (op0_fall && op1_taken)))
                     continue;
                 ++matched_adds;
-                std::cerr << "[DBG]   matched selection add in block '" << add->getParent()->getName().str()
-                          << "'\n";
+                //std::cerr << "[DBG]   matched selection add in block '" << add->getParent()->getName().str()
+                //          << "'\n";
 
                 auto *taken_c = llvm::ConstantInt::get(i32Ty, branch.vsp_taken);
                 auto *fall_c  = llvm::ConstantInt::get(i32Ty, branch.vsp_fall);
@@ -937,8 +922,6 @@ static uint32_t const_from_md(llvm::Metadata *m)
     return static_cast<uint32_t>(llvm::cast<llvm::ConstantInt>(cm->getValue())->getZExtValue());
 }
 
-// Run once the selector has been re-assembled into pure SSA (after SROA) but before InstCombine. Matches the same `add (and _,vsp_taken),
-// (and _,vsp_fall)` pattern as materialize_branch_vsp_constants()
 static unsigned rewrite_branch_conditions_on_selector(llvm::Function &fn)
 {
     auto *i32Ty = llvm::Type::getInt32Ty(fn.getContext());
@@ -1186,10 +1169,6 @@ struct LiftingContext
     VmpTrace                          trace;
     unsigned                          param_count;
     bool                              save_intermediate;
-    // True when the user supplied continuation VMs (--continue): the lifter follows
-    // each VMEXIT, emits the external call, and resumes at the next listed VM.
-    // Derived from continue_vmentries; also gates the ESP-window snapshot machinery
-    // (capture/seed), which must stay off the plain single-VM discovery path.
     bool                              follow_vmexit;
     std::vector<uint64_t>             continue_vmentries;  // next-VM VMENTER addrs, in order
     uint32_t                          host_return_address;
@@ -1676,9 +1655,7 @@ void LiftingContext::emit_block(const DevirtEmit &E, const VmBlock &block, llvm:
         mem = emit_handler_call(bldr, E.target, E.state, block.handlers[idx], mem);
     }
 
-    // VMEXIT continuation: emit the external (non-virtualized) call the VM exited
-    // to, as an opaque call, then flow into the next VM segment (block.next).
-    // Minimal fidelity: no args, clobber EAX with the return value.
+    // VMEXIT continuation: emit the external call as an opaque call then continue to the next VM
     if (block.external_call)
     {
         const ExternalCall &ec = *block.external_call;
@@ -1752,14 +1729,7 @@ void LiftingContext::emit_block(const DevirtEmit &E, const VmBlock &block, llvm:
                 bldr.CreateStore(word, dst, false);
             }
 
-            // ESP-centered window. At a VMEXIT the VSP window above is unusable (ESI
-            // restored to a native value), but ESP and the pivoted frame it points at
-            // (pushed call target / return addresses) are concrete; build_devirt seeds
-            // this window back so the exit fast-path can read the call target.
-            //
-            // Only emitted on the follow-vmexit path: these extra vmem reads perturb
-            // the probe's concretization/pruning and regressed normal branch discovery
-            // (Branch0 folded to `unreachable`). Plain runs never consume it.
+            // On VMEXIT, we do not need the VSP window but the ESP, because it exxecutes a stack pivot to restore
             if (follow_vmexit)
             {
             auto *esp_stack_g = get_or_create_global(E.target, "__vmp_snapshot_esp_stack", stackTy);
@@ -1906,15 +1876,7 @@ llvm::Function *LiftingContext::build_devirt(
     if (initial_snapshot && initial_snapshot->stack.size() == kVmpStackWindowBytes)
     {
         seed_window(b, unknown_byte_g, vmem, initial_snapshot->stack_base, initial_snapshot->stack, 0, kVmpStackWindowBytes);
-        // Also seed the ESP-centered window. A VMEXIT restore reads the pushed call
-        // target / return address off the pivoted (ESP/EBP) frame, which is not the
-        // VSP data-stack window above; without this the exit fast-path reads zeros
-        // and falls back to the (often un-foldable) full prefix.
-        //
-        // Only on the follow-vmexit path: the ESP window can overlap the VSP data
-        // stack, and seeding it on the normal discovery path overwrites VM-stack
-        // bytes the branch selector depends on, folding branches to `unreachable`
-        // (regressed Branch0). Plain runs never need it, so gate it off.
+        // Also seed the ESP-centered window (only on the multiple VMs path)
         if (follow_vmexit && initial_snapshot->esp_stack.size() == kVmpStackWindowBytes &&
             initial_snapshot->esp_stack_base)
             seed_window(b, unknown_byte_g, vmem, initial_snapshot->esp_stack_base, initial_snapshot->esp_stack, 0,
@@ -2052,10 +2014,7 @@ bool LiftingContext::discover_block(
 
             if (is_vmexit_restore)
             {
-                // Resolve the call the VM exits to from the exit EIP: import thunks
-                // (e.g. 0x13142 -> GetTickCount) and in-image targets (sub_XXXX) both
-                // fold to a constant and auto-resolve; internal targets get an opaque
-                // call with an auto-recovered argument count.
+                // Resolve the call the VM exits to from the exit EIP: if not dumped from memory its an original thunk
                 std::optional<ExternalCall> ext = follow_vmexit ? resolve_external_call(pe_info, next) : std::nullopt;
                 if (follow_vmexit)
                 {
@@ -2068,25 +2027,20 @@ bool LiftingContext::discover_block(
                 if (ext)
                     block.external_call = ext;  // opaque (imports + internal both)
 
-                // Chain into the next queued VM if one is supplied; otherwise this is
-                // the terminal exit (the external call, if any, is still emitted).
+                // Continue to next VM if supplied, else exit
                 if (follow_vmexit && continue_cursor < continue_vmentries.size())
                 {
                     uint64_t next_vm = continue_vmentries[continue_cursor++];
                     std::cout << "[*] follow-vmexit: continuing at next VM 0x" << std::hex << next_vm << std::dec
                               << " (" << continue_cursor << "/" << continue_vmentries.size() << ")\n";
-                    // Patch this VM entry's non-returning dispatcher call NOW (not up
-                    // front): handlers from earlier VMs are already lifted/cached, so
-                    // overwriting shared post-call bytes here cannot corrupt them.
+                    // Patch this VM entry's non-returning dispatcher call now (doing it earlier breaks discovery)
                     unsigned patched = 0;
                     patched_memory = patch_nonreturn_vmentry_calls(patched_memory, next_vm, &patched);
                     block.next = std::make_unique<VmBlock>();
                     return discover_block(*block.next, next_vm, {}, std::nullopt, std::nullopt);
                 }
 
-                // Terminal VM exit. With no resolved call, lift the result-finalizer
-                // stub the restore handler returns into; otherwise the call + `ret` is
-                // all that remains.
+                // Terminal VM exit
                 if (!ext && next != 0 && original_memory.count(next))
                 {
                     std::cout << "[*] VMEXIT: lifting result-finalizer stub 0x" << std::hex << next << std::dec
@@ -2137,16 +2091,11 @@ bool LiftingContext::discover_block(
         }
 
         // if Kind::Unknown
-        // A detected VMEXIT whose exit target can't be folded is a graceful end of
-        // this VM segment: if a continuation is queued, chain into it; otherwise it
-        // is the terminal exit (emit `ret EAX`). Only treat a non-VMEXIT Unknown as
-        // a discovery failure.
         if (is_vmexit_restore && follow_vmexit)
         {
             if (continue_cursor < continue_vmentries.size())
             {
-                // The exit EIP didn't fold to a call target, so emit no external call;
-                // just resume at the next queued VM.
+                // The exit EIP didn't fold to a call target, so emit no external call so just resume at the next queued VM.
                 uint64_t next_vm = continue_vmentries[continue_cursor++];
                 std::cout << "[*] follow-vmexit @0x" << std::hex << current_addr
                           << ": exit target unresolved; continuing at next VM 0x" << next_vm << std::dec
