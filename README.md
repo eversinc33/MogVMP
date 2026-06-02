@@ -13,6 +13,10 @@ That being said, **MogVMP is a PoC I created to learn Remill** - do not expect p
  
 ## Examples
 
+A VMP 3.0.9 [DevirtualizeMe](https://forum.tuts4you.com/topic/39481-devirtualizeme-vmprotect-309/) from Tuts4You: 
+
+![](./img/devirtme.png)
+
 Simple Math function with a static CFG:
 
 ![](./img/lifted_math.png)
