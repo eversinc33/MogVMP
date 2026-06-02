@@ -1753,6 +1753,12 @@ void LiftingContext::emit_block(const DevirtEmit &E, const VmBlock &block, llvm:
             // restored to a native value), but ESP and the pivoted frame it points at
             // (pushed call target / return addresses) are concrete; build_devirt seeds
             // this window back so the exit fast-path can read the call target.
+            //
+            // Only emitted on the follow-vmexit path: these extra vmem reads perturb
+            // the probe's concretization/pruning and regressed normal branch discovery
+            // (Branch0 folded to `unreachable`). Plain runs never consume it.
+            if (follow_vmexit)
+            {
             auto *esp_stack_g = get_or_create_global(E.target, "__vmp_snapshot_esp_stack", stackTy);
             auto *esp_base_g  = get_or_create_global(E.target, "__vmp_snapshot_esp_base", i32Ty);
             auto *esp_ptr     = bldr.CreateConstGEP1_32(i8Ty, E.state, kESPOffset, "snapshot_esp_ptr");
@@ -1767,6 +1773,7 @@ void LiftingContext::emit_block(const DevirtEmit &E, const VmBlock &block, llvm:
                 auto *word = bldr.CreateLoad(i32Ty, src, "snapshot_esp_stack_word");
                 auto *dst  = bldr.CreateConstGEP2_32(stackTy, esp_stack_g, 0, i, "snapshot_esp_stack_dst");
                 bldr.CreateStore(word, dst, false);
+            }
             }
         }
         bldr.CreateRet(ret_val);
@@ -1900,7 +1907,13 @@ llvm::Function *LiftingContext::build_devirt(
         // target / return address off the pivoted (ESP/EBP) frame, which is not the
         // VSP data-stack window above; without this the exit fast-path reads zeros
         // and falls back to the (often un-foldable) full prefix.
-        if (initial_snapshot->esp_stack.size() == kVmpStackWindowBytes && initial_snapshot->esp_stack_base)
+        //
+        // Only on the follow-vmexit path: the ESP window can overlap the VSP data
+        // stack, and seeding it on the normal discovery path overwrites VM-stack
+        // bytes the branch selector depends on, folding branches to `unreachable`
+        // (regressed Branch0). Plain runs never need it, so gate it off.
+        if (follow_vmexit && initial_snapshot->esp_stack.size() == kVmpStackWindowBytes &&
+            initial_snapshot->esp_stack_base)
             seed_window(b, unknown_byte_g, vmem, initial_snapshot->esp_stack_base, initial_snapshot->esp_stack, 0,
                         kVmpStackWindowBytes);
     }

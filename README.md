@@ -2,7 +2,7 @@
   <img src="img/mog.png" width="400"> 
 
   <h1 align="center">MogVMP</h1>
-  <p align="center">Devirtualizer for 32bit binaries protected by VMProtect 3.5.</p>
+  <p align="center">Devirtualizer for 32bit binaries protected by VMProtect 3.0-3.5.</p>
 </p>
 
 MogVMP lifts code to LLVM using [Remill](https://github.com/lifting-bits/remill) to recover the original semantics behind a virtualized function. Instead of modeling the VM specific handler semantics individually (like in my previous work on [byteshield](https://eversinc33.com/2026/05/07/llvm-devirtualizer)), the whole x86 assembly code of each handler is lifted. Junk code, as well as the virtualization layer,  is subsequently optimized away by LLVMs built-in optimization passes and a custom pass that does aliasing-aware constant propagation and store forwarding over memory allocas.
