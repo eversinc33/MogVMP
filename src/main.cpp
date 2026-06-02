@@ -1,10 +1,9 @@
 #include <llvm/Support/raw_ostream.h>
 
-#include <cctype>
 #include <cstdint>
-#include <fstream>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -54,64 +53,17 @@ bool parse_u64_arg(const std::string &text, const char *name, uint64_t &out)
     }
 }
 
-bool parse_replay_handlers(const std::string &path, std::vector<uint64_t> &handlers)
-{
-    std::ifstream input(path);
-    if (!input)
-    {
-        std::cerr << "Cannot open replay handler list: " << path << "\n";
-        return false;
-    }
-
-    std::string line;
-    unsigned    line_no = 0;
-    while (std::getline(input, line))
-    {
-        ++line_no;
-        while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back())))
-            line.pop_back();
-        size_t begin = 0;
-        while (begin < line.size() && std::isspace(static_cast<unsigned char>(line[begin])))
-            ++begin;
-        line = line.substr(begin);
-        if (line.empty())
-            continue;
-        try
-        {
-            size_t   idx   = 0;
-            uint64_t value = std::stoull(line, &idx, 0);
-            if (idx != line.size() || value == 0)
-                throw std::invalid_argument("invalid address");
-            handlers.push_back(value);
-        }
-        catch (const std::exception &)
-        {
-            std::cerr << "Invalid replay handler address at " << path << ":" << line_no << ": " << line << "\n";
-            return false;
-        }
-    }
-
-    if (handlers.empty())
-    {
-        std::cerr << "Replay handler list is empty: " << path << "\n";
-        return false;
-    }
-    std::cout << "[*] Replay handlers: " << std::dec << handlers.size() << " entries from " << path << "\n";
-    return true;
-}
-
 }  // namespace
 
 int main(int argc, char *argv[])
 {
     // Args
     bool                        save_intermediate = false;
+    std::vector<uint64_t>       continue_vmentries;
     unsigned                    param_count = 0;
     bool                        have_param_count = false;
     VmpTrace                    trace;
     bool                        have_vmenter = false;
-    std::string                 replay_path;
-    std::vector<uint64_t>       replay_handlers;
     std::vector<const char *>   positional;
 
     // Parse args
@@ -121,6 +73,31 @@ int main(int argc, char *argv[])
         if (arg == "--save-intermediate-steps")
         {
             save_intermediate = true;
+        }
+        else if (arg == "--continue")
+        {
+            // Comma-separated VMENTER addresses of the VMs reached after each VMEXIT,
+            // in order. Enables following VMEXITs and resuming at the next listed VM.
+            if (++i >= argc)
+            {
+                std::cerr << "Missing comma-separated address list after --continue\n";
+                return 1;
+            }
+            std::string        token;
+            std::istringstream ss(argv[i]);
+            while (std::getline(ss, token, ','))
+            {
+                size_t b = token.find_first_not_of(" \t");
+                size_t e = token.find_last_not_of(" \t");
+                if (b == std::string::npos)
+                    continue;
+                token = token.substr(b, e - b + 1);
+
+                uint64_t reentry = 0;
+                if (!parse_u64_arg(token, "--continue vmentry", reentry))
+                    return 1;
+                continue_vmentries.push_back(reentry);
+            }
         }
         else if (arg == "--args")
         {
@@ -139,15 +116,6 @@ int main(int argc, char *argv[])
             if (++i >= argc || !parse_u64_arg(argv[i], "--imagebase", trace.image_base))
                 return 1;
         }
-        else if (arg == "--replay")
-        {
-            if (++i >= argc)
-            {
-                std::cerr << "Missing path after --replay\n";
-                return 1;
-            }
-            replay_path = argv[i];
-        }
         else
         {
             positional.push_back(argv[i]);
@@ -158,10 +126,11 @@ int main(int argc, char *argv[])
     if (positional.size() != 2 || !have_vmenter)
     {
         std::cerr << "Usage: " << argv[0]
-                  << " [--save-intermediate-steps] [--replay <handlers.txt>]"
+                  << " [--save-intermediate-steps] [--continue <vmentry,...>]"
                      " [--args <count>] --vmenter <0xADDR> [--imagebase <0xADDR>] <pe_file> <output.ll>\n"
                   << "  e.g. " << argv[0] << " --args 2 --vmenter 0x401000 vmp.exe lifted.ll\n"
-                  << "  --args is optional; when omitted, argc is inferred from the stack pushes.\n";
+                  << "  --args is optional; when omitted, argc is inferred from the stack pushes.\n"
+                  << "  --continue lists the VMENTER addresses reached after each VMEXIT, in order.\n";
         return 1;
     }
 
@@ -172,9 +141,6 @@ int main(int argc, char *argv[])
     if (trace.image_base != 0)
         std::cout << ", imagebase=0x" << trace.image_base;
     std::cout << std::dec << "\n";
-
-    if (!replay_path.empty() && !parse_replay_handlers(replay_path, replay_handlers))
-        return 1;
 
     // Load PE
     Memory memory;
@@ -198,7 +164,7 @@ int main(int argc, char *argv[])
     std::optional<unsigned> param_count_opt;
     if (have_param_count)
         param_count_opt = param_count;
-    auto result = VmpLifter{}.run(memory, trace, param_count_opt, save_intermediate, replay_handlers);
+    auto result = VmpLifter{}.run(memory, info, trace, param_count_opt, save_intermediate, continue_vmentries);
     if (!result)
         return 1;
 

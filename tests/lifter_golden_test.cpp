@@ -119,7 +119,8 @@ static fs::path TestTempDir()
 }
 
 static LifterRunResult RunLifter(
-    unsigned args, std::string_view exe_name, std::string_view vmenter, std::string_view stem
+    unsigned args, std::string_view exe_name, std::string_view vmenter, std::string_view stem,
+    std::string_view continue_csv = ""
 )
 {
     fs::path temp_dir = TestTempDir();
@@ -129,8 +130,10 @@ static LifterRunResult RunLifter(
     fs::path           lifter = LIFTER_BIN;
     fs::path           data_dir = TEST_DATA_DIR;
     std::ostringstream cmd;
-    cmd << ShellQuote(lifter) << " --args " << args << " --vmenter " << vmenter << ' '
-        << ShellQuote(data_dir / exe_name) << ' ' << ShellQuote(out_ll) << " > " << ShellQuote(log) << " 2>&1";
+    cmd << ShellQuote(lifter) << " --args " << args << " --vmenter " << vmenter;
+    if (!continue_csv.empty())
+        cmd << " --continue " << continue_csv;
+    cmd << ' ' << ShellQuote(data_dir / exe_name) << ' ' << ShellQuote(out_ll) << " > " << ShellQuote(log) << " 2>&1";
 
     int rc = std::system(cmd.str().c_str());
     if (rc != 0)
@@ -167,6 +170,16 @@ static const LifterRunResult &RunVmp4TraceOnce()
 static const LifterRunResult &RunBranch0Once()
 {
     static const LifterRunResult result = RunLifter(1, "Branch0.vmp.exe", "0x403A5D", "branch0");
+    return result;
+}
+
+static const LifterRunResult &RunDevirtMeChainOnce()
+{
+    // Multi-VM chain: the program exits each VM to call a native function, then
+    // re-enters a new VM. --continue lists the next-VM VMENTER addresses in order.
+    // VM1 -> GetTickCount -> VM2 -> sub_401000 (swprintf_s) -> VM3 -> MessageBoxW.
+    static const LifterRunResult result =
+        RunLifter(2, "devirtualizeme32_vmp_3.0.9_v1.exe", "0x0040C890", "devirtme", "0x4312d7,0x41F618");
     return result;
 }
 
@@ -250,4 +263,37 @@ TEST(LifterGoldenTest, Branch0DevirtualizesToSelectOnEqualsOne)
     EXPECT_TRUE(has_select_zero) << run.devirt;  // ? 0 : x
     EXPECT_TRUE(has_ret) << run.devirt;
     EXPECT_NE(run.devirt.find("%arg0"), std::string::npos) << run.devirt;
+}
+
+TEST(LifterGoldenTest, DevirtMeChainEmitsExternalCalls)
+{
+    // Multi-VM continuation: each VMEXIT calls a native function and re-enters a
+    // new VM. The lifted @devirt must contain the three opaque calls in order, with
+    // GetTickCount's result flowing through the MBA chain into sub_401000's args
+    // (whose count is auto-recovered to 4, not the probed upper bound).
+    const auto &run = RunDevirtMeChainOnce();
+    ASSERT_FALSE(run.devirt.empty()) << run.log;
+
+    auto lines = DevirtInstructionLines(run.devirt);
+    EXPECT_EQ(lines.size(), 15u) << run.devirt;  // GetTickCount + 11 MBA ops + sub_401000 + MessageBoxW + ret
+
+    // The three external calls, in program order.
+    const auto tick = run.devirt.find("@GetTickCount(");
+    const auto sprf = run.devirt.find("@sub_401000(");
+    const auto mbox = run.devirt.find("@MessageBoxW(");
+    ASSERT_NE(tick, std::string::npos) << run.devirt;
+    ASSERT_NE(sprf, std::string::npos) << run.devirt;
+    ASSERT_NE(mbox, std::string::npos) << run.devirt;
+    EXPECT_LT(tick, sprf) << run.devirt;
+    EXPECT_LT(sprf, mbox) << run.devirt;
+
+    // sub_401000 (swprintf_s) keeps exactly 4 recovered args, the last being the
+    // SSA-computed MBA value derived from GetTickCount (not a folded constant).
+    const auto open = run.devirt.find('(', sprf);
+    const auto close = run.devirt.find(')', open);
+    ASSERT_NE(close, std::string::npos) << run.devirt;
+    const std::string call_args = run.devirt.substr(open + 1, close - open - 1);
+    EXPECT_EQ(std::count(call_args.begin(), call_args.end(), ',') + 1, 4) << call_args;
+    const auto last_comma = call_args.rfind(',');
+    EXPECT_NE(Trim(call_args.substr(last_comma + 1)).find("i32 %"), std::string::npos) << call_args;
 }

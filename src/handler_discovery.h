@@ -36,9 +36,16 @@ struct VmpBranchInfo
 
 struct PrefixSnapshot
 {
-    uint32_t stack_base = 0;
+    uint32_t stack_base = 0;  // base VA of the VSP(ESI)-centered window (0 if not concretized)
     std::vector<std::optional<uint8_t>> state;
     std::vector<std::optional<uint8_t>> stack;
+
+    // ESP-centered window, needed at a VMEXIT where the VM stack pointer (ESI) is
+    // restored to a non-constant native value but ESP (and the native return
+    // addresses / pushed call target on the pivoted frame) is concrete. Seeded back
+    // by build_devirt so the exit fast-path can read the call target.
+    uint32_t esp_stack_base = 0;  // base VA of the ESP-centered window (0 if absent)
+    std::vector<std::optional<uint8_t>> esp_stack;
 };
 
 // Result of one prefix-discovery step.

@@ -34,6 +34,66 @@ static void WriteU32(Memory &memory, uint64_t addr, uint32_t value)
     for (unsigned i = 0; i < 4; ++i) memory[addr + i] = static_cast<uint8_t>(value >> (i * 8));
 }
 
+// Read a NUL-terminated ASCII string from mapped memory (bounded).
+static std::string ReadCStr(const Memory &memory, uint64_t addr, size_t max_len = 256)
+{
+    std::string s;
+    for (size_t i = 0; i < max_len; ++i)
+    {
+        auto it = memory.find(addr + i);
+        if (it == memory.end() || it->second == 0)
+            break;
+        s.push_back(static_cast<char>(it->second));
+    }
+    return s;
+}
+
+// Parse the import directory (data dir index 1) into info.import_by_orig_thunk.
+// Best-effort: silently leaves the map empty when the table is absent or mangled
+// (VMProtect often rebuilds it); callers then fall back to opaque-by-address.
+static void ParseImports(const Memory &memory, PEInfo &info, uint32_t import_rva)
+{
+    if (import_rva == 0)
+        return;
+    const uint64_t base = info.image_base;
+
+    for (uint32_t desc = 0;; desc += 20)
+    {
+        uint32_t ilt_rva = 0, name_rva = 0, iat_rva = 0;
+        if (!ReadU32(memory, base + import_rva + desc + 0, ilt_rva) ||
+            !ReadU32(memory, base + import_rva + desc + 12, name_rva) ||
+            !ReadU32(memory, base + import_rva + desc + 16, iat_rva))
+            break;
+        if (ilt_rva == 0 && name_rva == 0 && iat_rva == 0)
+            break;  // terminating null descriptor
+
+        std::string dll = ReadCStr(memory, base + name_rva);
+        // Prefer the ILT (import names) for symbol resolution; the IAT gives the
+        // slot address that a `call [slot]` actually reads.
+        uint32_t names_rva = ilt_rva ? ilt_rva : iat_rva;
+        for (uint32_t i = 0;; ++i)
+        {
+            uint32_t thunk = 0;
+            if (!ReadU32(memory, base + names_rva + i * 4, thunk) || thunk == 0)
+                break;
+
+            PEImport imp;
+            imp.dll = dll;
+            if (thunk & 0x80000000u)
+            {
+                imp.by_ordinal = true;
+                imp.ordinal    = static_cast<uint16_t>(thunk & 0xffffu);
+            }
+            else
+            {
+                // thunk = RVA to IMAGE_IMPORT_BY_NAME { uint16 hint; char name[]; }
+                imp.symbol = ReadCStr(memory, base + (thunk & 0x7fffffffu) + 2);
+            }
+            info.import_by_orig_thunk[thunk] = std::move(imp);
+        }
+    }
+}
+
 namespace peload
 {
 
@@ -125,13 +185,16 @@ bool LoadPE(const std::string &path, Memory &memory, PEInfo &info)
         return false;
     }
 
-    // Base relocation data directory (index 5).  Used when a trace was
-    // collected from an ASLR-rebased image.
+    // Data directories.  Index 1 = import table, index 5 = base relocations
+    // (used when a trace was collected from an ASLR-rebased image).
     size_t data_dir_offset = 0;
     if (opt_magic == 0x010b)
         data_dir_offset = opt_offset + 96;
     else if (opt_magic == 0x020b)
         data_dir_offset = opt_offset + 112;
+    uint32_t import_rva = 0;
+    if (data_dir_offset + 1 * 8 + 4 <= data.size())
+        std::memcpy(&import_rva, data.data() + data_dir_offset + 1 * 8, 4);
     if (data_dir_offset + 5 * 8 + 8 <= data.size())
     {
         std::memcpy(&info.base_reloc_rva, data.data() + data_dir_offset + 5 * 8, 4);
@@ -147,11 +210,16 @@ bool LoadPE(const std::string &path, Memory &memory, PEInfo &info)
         if (sh + 40 > data.size())
             break;
 
-        uint32_t virt_size, virt_addr, raw_size, raw_offset;
+        uint32_t virt_size, virt_addr, raw_size, raw_offset, characteristics;
         std::memcpy(&virt_size, data.data() + sh + 8, 4);
         std::memcpy(&virt_addr, data.data() + sh + 12, 4);
         std::memcpy(&raw_size, data.data() + sh + 16, 4);
         std::memcpy(&raw_offset, data.data() + sh + 20, 4);
+        std::memcpy(&characteristics, data.data() + sh + 36, 4);
+
+        char name_buf[9] = {0};
+        std::memcpy(name_buf, data.data() + sh, 8);
+        info.sections.push_back(PESection{std::string(name_buf), virt_addr, virt_size, characteristics});
 
         uint64_t va = info.image_base + virt_addr;
         size_t   copy_size = std::min({(size_t)raw_size, (size_t)virt_size, data.size() - (size_t)raw_offset});
@@ -161,6 +229,9 @@ bool LoadPE(const std::string &path, Memory &memory, PEInfo &info)
             memory[va + j] = data[raw_offset + j];
         }
     }
+
+    // Imports must be parsed after sections are mapped (the tables live in them).
+    ParseImports(memory, info, import_rva);
 
     return true;
 }
@@ -227,6 +298,26 @@ void RebaseMemory(Memory &memory, uint64_t old_base, uint64_t new_base)
     Memory rebased;
     for (const auto &[addr, byte] : memory) rebased[(addr - old_base) + new_base] = byte;
     memory = std::move(rebased);
+}
+
+const PESection *SectionOf(const PEInfo &info, uint64_t addr)
+{
+    if (addr < info.image_base)
+        return nullptr;
+    const uint64_t rva = addr - info.image_base;
+    for (const auto &s : info.sections)
+        if (rva >= s.rva && rva < static_cast<uint64_t>(s.rva) + s.virt_size)
+            return &s;
+    return nullptr;
+}
+
+const PEImport *ImportByThunk(const PEInfo &info, uint32_t thunk_value)
+{
+    auto it = info.import_by_orig_thunk.find(thunk_value);
+    if (it != info.import_by_orig_thunk.end())
+        return &it->second;
+    it = info.import_by_orig_thunk.find(thunk_value & 0x7fffffffu);
+    return it == info.import_by_orig_thunk.end() ? nullptr : &it->second;
 }
 
 }  // namespace peload

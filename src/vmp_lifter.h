@@ -39,8 +39,12 @@ class VmpLifter
     // Targets x86-32/Windows only. Returns a LiftResult (falsy on failure).
     // param_count: number of symbolic function arguments. Pass std::nullopt to
     // infer it from the `push <reg>` sequence ahead of the VMENTER call.
+    // continue_vmentries: VMENTER addresses of the VMs reached after each VMEXIT,
+    // in order. When non-empty the lifter follows VMEXITs (emitting the external
+    // call the VM exited to) and resumes at the next listed VM; empty means lift a
+    // single VM and stop at its first VMEXIT.
     LiftResult run(
-        const Memory &memory, VmpTrace trace, std::optional<unsigned> param_count,
-        bool save_intermediate = false, llvm::ArrayRef<uint64_t> replay_handlers = {}
+        const Memory &memory, const PEInfo &pe_info, VmpTrace trace, std::optional<unsigned> param_count,
+        bool save_intermediate = false, llvm::ArrayRef<uint64_t> continue_vmentries = {}
     );
 };

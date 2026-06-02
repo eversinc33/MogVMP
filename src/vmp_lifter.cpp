@@ -33,6 +33,7 @@
 #include <array>
 #include <iostream>
 #include <memory>
+#include <cstdio>
 #include <optional>
 #include <set>
 #include <string>
@@ -61,11 +62,75 @@ struct StateInjectPatch
     bool overwrite = true;
 };
 
+// An external (non-virtualized) function the VM exits to call, recovered from the
+// VMEXIT EIP via the import original-thunk map. Emitted as an opaque call.
+struct ExternalCall
+{
+    std::string dll;
+    std::string symbol;       // empty when by_ordinal
+    uint16_t    ordinal = 0;
+    bool        by_ordinal = false;
+    uint32_t    thunk = 0;    // import: original-thunk value; internal: the code VA
+    unsigned    argc = 0;     // stack args to read at the call site (0 = none)
+    bool        internal = false;  // true => `thunk` is an in-image code VA
+    // True => argc is a provisional upper bound; the real count is recovered after
+    // concretization by trim_inferred_call_args (the call is emitted as varargs so
+    // it can be re-pointed to fewer args). Used for internal targets whose signature
+    // we don't know (e.g. a CRT swprintf wrapper reached via VMEXIT).
+    bool        infer_argc = false;
+};
+
+// How many stack slots to read for an infer_argc call before trimming. Generous;
+// the trim pass discards the leftover tail past the real argument list.
+constexpr unsigned kInferArgcProbe = 8;
+
+// Known stdcall arg counts for common imports, so args are recovered without a
+// user-supplied count. Extend as needed.
+static unsigned known_import_argc(const std::string &symbol)
+{
+    if (symbol == "GetTickCount") return 0;
+    if (symbol == "MessageBoxW" || symbol == "MessageBoxA") return 4;
+    return 0;
+}
+
+// Resolve a VMEXIT call target to a named external call: an import (the target is
+// an original-thunk value) or an internal function in a non-.vmp executable
+// section (named sub_<addr>). Returns nullopt when the target isn't a recognizable
+// call site.
+static std::optional<ExternalCall> resolve_external_call(const PEInfo &pe_info, uint32_t target)
+{
+    if (const PEImport *imp = peload::ImportByThunk(pe_info, target))
+    {
+        ExternalCall ec{imp->dll, imp->symbol, imp->ordinal, imp->by_ordinal, target};
+        ec.argc = known_import_argc(imp->symbol);
+        return ec;
+    }
+    if (const PESection *s = peload::SectionOf(pe_info, target);
+        s && s->name.rfind(".vmp", 0) != 0 && (s->characteristics & 0x20000000u))
+    {
+        char buf[24];
+        std::snprintf(buf, sizeof buf, "sub_%X", target);
+        ExternalCall ec;
+        ec.symbol     = buf;
+        ec.thunk      = target;
+        ec.internal   = true;  // real in-image code -> opaque call, args recovered
+        ec.infer_argc = true;
+        ec.argc       = kInferArgcProbe;
+        return ec;
+    }
+    return std::nullopt;
+}
+
 struct VmBlock
 {
     std::vector<uint64_t> handlers;
 
     bool at_vmexit = false;
+
+    // Set on a VMEXIT block that continues into another VM (via --continue). The
+    // external call (if the exit resolves to an import) is emitted, then control
+    // flows into `next` (the next VM segment) instead of returning.
+    std::optional<ExternalCall> external_call;
 
     std::unique_ptr<VmBlock> next;
 
@@ -278,17 +343,13 @@ static Memory patch_nonreturn_vmentry_calls(const Memory &memory, uint64_t vment
 
 /**
  * Heuristically identify a vmexit handler by counting the number of pop instructions - if more
- * than 6, it is likely a vmexit
+ * than 6, it is likely a vmexit. This routine follows direct jumps
  * @param memory
  * @param addr
  * @return
  */
 static bool looks_like_vmexit_restore_handler(const Memory &memory, uint64_t addr)
 {
-    // The guest-register restore (POPAD-style) does many pops and ends in a `ret`
-    // into the native epilogue. VMProtect splits it across several obfuscated
-    // blocks linked by unconditional jmps, so follow that jmp chain (not just one
-    // hop), accumulating pops, until the terminating `ret`.
     unsigned                     pops = 0;
     bool                         has_ret = false;
     std::unordered_set<uint64_t> seen_blocks;
@@ -530,6 +591,53 @@ static unsigned erase_unused_undefined8_calls(llvm::Module &module)
     return unused.size();
 }
 
+static unsigned trim_inferred_call_args(llvm::Function &fn, const PEInfo &pe_info)
+{
+    auto is_exec_ptr = [&pe_info](llvm::Value *v) -> bool
+    {
+        auto *ci = llvm::dyn_cast<llvm::ConstantInt>(v);
+        if (!ci)
+            return false;
+        const PESection *s = peload::SectionOf(pe_info, ci->getZExtValue());
+        return s && (s->characteristics & 0x20000000u);  // IMAGE_SCN_MEM_EXECUTE
+    };
+
+    // A VMEXIT call transition leaves the arguments above the return address, so we probe for a pointer to the PE memory and then extract the arguments
+    llvm::SmallVector<llvm::CallInst *, 8> targets;
+    for (auto &bb : fn)
+        for (auto &inst : bb)
+            if (auto *ci = llvm::dyn_cast<llvm::CallInst>(&inst))
+                if (auto *callee = ci->getCalledFunction();
+                    callee && callee->isDeclaration() && callee->isVarArg() && ci->arg_size() > 0)
+                    targets.push_back(ci);
+
+    unsigned trimmed = 0;
+    for (auto *ci : targets)
+    {
+        unsigned argc = ci->arg_size();
+        for (unsigned i = 1; i < ci->arg_size(); ++i)
+            if (is_exec_ptr(ci->getArgOperand(i)))
+            {
+                argc = i;  // saved return address == end of the argument list
+                break;
+            }
+        if (argc == ci->arg_size())
+            continue;
+
+        std::vector<llvm::Value *> args;
+        for (unsigned i = 0; i < argc; ++i) args.push_back(ci->getArgOperand(i));
+        llvm::IRBuilder<> bldr(ci);
+        auto *repl = bldr.CreateCall(ci->getCalledFunction(), args);
+        repl->setTailCall(ci->isTailCall());
+        if (!ci->use_empty())
+            ci->replaceAllUsesWith(repl);
+        repl->takeName(ci);
+        ci->eraseFromParent();
+        ++trimmed;
+    }
+    return trimmed;
+}
+
 static void neutralize_dispatch_intrinsics(llvm::Module &module)
 {
     for (const char *name : {"__remill_jump", "__remill_function_return"})
@@ -610,11 +718,11 @@ static unsigned materialize_branch_vsp_constants(llvm::Function &fn, const VmBlo
     unsigned changed = 0;
     auto    *i32Ty = llvm::Type::getInt32Ty(fn.getContext());
 
-    std::cerr << "[DBG] materialize_branch_vsp_constants: " << branches.size() << " branch(es)\n";
+    //std::cerr << "[DBG] materialize_branch_vsp_constants: " << branches.size() << " branch(es)\n";
     for (const auto &branch : branches)
     {
-        std::cerr << "[DBG]   branch vsp_taken=0x" << std::hex << branch.vsp_taken
-                  << " vsp_fall=0x" << branch.vsp_fall << std::dec << "\n";
+        //std::cerr << "[DBG]   branch vsp_taken=0x" << std::hex << branch.vsp_taken
+        //          << " vsp_fall=0x" << branch.vsp_fall << std::dec << "\n";
         llvm::BasicBlock *taken_bb = nullptr;
         llvm::BasicBlock *fall_bb = nullptr;
         for (auto &bb : fn)
@@ -626,8 +734,8 @@ static unsigned materialize_branch_vsp_constants(llvm::Function &fn, const VmBlo
         }
         if (!taken_bb || !fall_bb)
         {
-            std::cerr << "[DBG]   taken_bb=" << (void *)taken_bb << " fall_bb=" << (void *)fall_bb
-                      << " (one missing, skipping)\n";
+            //std::cerr << "[DBG]   taken_bb=" << (void *)taken_bb << " fall_bb=" << (void *)fall_bb
+            //          << " (one missing, skipping)\n";
             continue;
         }
 
@@ -649,8 +757,8 @@ static unsigned materialize_branch_vsp_constants(llvm::Function &fn, const VmBlo
                 if (!((op0_taken && op1_fall) || (op0_fall && op1_taken)))
                     continue;
                 ++matched_adds;
-                std::cerr << "[DBG]   matched selection add in block '" << add->getParent()->getName().str()
-                          << "'\n";
+                //std::cerr << "[DBG]   matched selection add in block '" << add->getParent()->getName().str()
+                //          << "'\n";
 
                 auto *taken_c = llvm::ConstantInt::get(i32Ty, branch.vsp_taken);
                 auto *fall_c  = llvm::ConstantInt::get(i32Ty, branch.vsp_fall);
@@ -814,8 +922,6 @@ static uint32_t const_from_md(llvm::Metadata *m)
     return static_cast<uint32_t>(llvm::cast<llvm::ConstantInt>(cm->getValue())->getZExtValue());
 }
 
-// Run once the selector has been re-assembled into pure SSA (after SROA) but before InstCombine. Matches the same `add (and _,vsp_taken),
-// (and _,vsp_fall)` pattern as materialize_branch_vsp_constants()
 static unsigned rewrite_branch_conditions_on_selector(llvm::Function &fn)
 {
     auto *i32Ty = llvm::Type::getInt32Ty(fn.getContext());
@@ -1032,7 +1138,9 @@ using ArmForce  = std::optional<std::pair<unsigned, bool>>;
 constexpr uint32_t kStateBytes           = 4096;
 constexpr uint32_t kVmpStackWindowBytes  = 512;
 constexpr uint32_t kVmpStackWindowRadius = kVmpStackWindowBytes / 2;
+constexpr uint32_t kEAXOffset            = 2216;
 constexpr uint32_t kESIOffset            = 2280;
+constexpr uint32_t kESPOffset            = 2312;
 constexpr uint32_t kSnapshotStateBegin   = 2048;
 constexpr uint32_t kSnapshotStateEnd     = 2560;
 
@@ -1051,6 +1159,7 @@ struct LiftingContext
 {
     llvm::LLVMContext                &ctx;
     const Memory                     &original_memory;
+    const PEInfo                     &pe_info;
     remill::Arch::ArchPtr             arch;
     std::unique_ptr<llvm::Module>     sem_module;
     Memory                            patched_memory;
@@ -1060,11 +1169,14 @@ struct LiftingContext
     VmpTrace                          trace;
     unsigned                          param_count;
     bool                              save_intermediate;
+    bool                              follow_vmexit;
+    std::vector<uint64_t>             continue_vmentries;  // next-VM VMENTER addrs, in order
     uint32_t                          host_return_address;
     std::vector<HostRegisterBinding>  host_reg_bindings;
 
     // Discovery state
     std::unordered_set<uint64_t>      global_seen;
+    size_t                            continue_cursor = 0;  // next index into continue_vmentries
     unsigned                          step_counter = 0;
     DiscoveryEngine                   discovery;
     static constexpr unsigned         kMaxHandlers = 1024;
@@ -1072,6 +1184,7 @@ struct LiftingContext
     LiftingContext(
         llvm::LLVMContext                   &ctx,
         const Memory                        &original_memory,
+        const PEInfo                        &pe_info,
         remill::Arch::ArchPtr                arch,
         std::unique_ptr<llvm::Module>        sem_module,
         Memory                               patched_memory,
@@ -1079,11 +1192,13 @@ struct LiftingContext
         VmpTrace                             trace,
         unsigned                             param_count,
         bool                                 save_intermediate,
+        std::vector<uint64_t>                continue_vmentries,
         uint32_t                             host_return_address,
         std::vector<HostRegisterBinding>     host_reg_bindings
     )
         : ctx(ctx)
         , original_memory(original_memory)
+        , pe_info(pe_info)
         , arch(std::move(arch))
         , sem_module(std::move(sem_module))
         , patched_memory(std::move(patched_memory))
@@ -1093,6 +1208,8 @@ struct LiftingContext
         , trace(trace)
         , param_count(param_count)
         , save_intermediate(save_intermediate)
+        , follow_vmexit(!continue_vmentries.empty())
+        , continue_vmentries(std::move(continue_vmentries))
         , host_return_address(host_return_address)
         , host_reg_bindings(std::move(host_reg_bindings))
         , discovery(*this->sem_module, this->vm.initializer, this->original_memory, this->save_intermediate, this->step_counter)
@@ -1100,7 +1217,7 @@ struct LiftingContext
         manager.lift_set.insert(trace.vmenter);
     }
 
-    std::unique_ptr<llvm::Module> execute(llvm::ArrayRef<uint64_t> replay_handlers);
+    std::unique_ptr<llvm::Module> execute();
 
     void            prepare_lifted_handler(uint64_t handler_addr);
     void            lift_handler(uint64_t addr);
@@ -1538,6 +1655,45 @@ void LiftingContext::emit_block(const DevirtEmit &E, const VmBlock &block, llvm:
         mem = emit_handler_call(bldr, E.target, E.state, block.handlers[idx], mem);
     }
 
+    // VMEXIT continuation: emit the external call as an opaque call then continue to the next VM
+    if (block.external_call)
+    {
+        const ExternalCall &ec = *block.external_call;
+        std::string callee_name = ec.by_ordinal ? (ec.dll + "_ordinal_" + std::to_string(ec.ordinal)) : ec.symbol;
+        if (callee_name.empty())
+            callee_name = "vmp_extern_" + std::to_string(ec.thunk);
+
+        // Recover stack arguments: after the restore-handler `ret`, ESP points at the
+        // call's return address, so the cdecl/stdcall args are mem[ESP+4 + 4*i]. The
+        // whole-function concretization later folds these to the computed values.
+        std::vector<llvm::Value *> args;
+        std::vector<llvm::Type *>  arg_tys;
+        if (ec.argc)
+        {
+            auto *esp_ptr = bldr.CreateConstGEP1_32(i8Ty, E.state, kESPOffset, "extern_esp_ptr");
+            auto *esp     = bldr.CreateLoad(i32Ty, esp_ptr, "extern_esp");
+            for (unsigned i = 0; i < ec.argc; ++i)
+            {
+                auto *addr = bldr.CreateAdd(esp, llvm::ConstantInt::get(i32Ty, 4 + 4 * i), "extern_arg_addr");
+                auto *off  = bldr.CreateSub(addr, vm.base, "extern_arg_off");
+                auto *src  = bldr.CreateGEP(i8Ty, mem, off, "extern_arg_src");
+                args.push_back(bldr.CreateLoad(i32Ty, src, "extern_arg"));
+                arg_tys.push_back(i32Ty);
+            }
+        }
+
+        // infer_argc calls are declared varargs with NO fixed params (i32(...)), so
+        // trim_inferred_call_args can later rebuild the call with the recovered
+        // (smaller) argument count against the same declaration without a fixed-param
+        // count mismatch.
+        auto *fnTy   = ec.infer_argc ? llvm::FunctionType::get(i32Ty, {}, /*isVarArg=*/true)
+                                     : llvm::FunctionType::get(i32Ty, arg_tys, /*isVarArg=*/false);
+        auto  callee = E.target.getOrInsertFunction(callee_name, fnTy);
+        auto *res    = bldr.CreateCall(callee, args, callee_name + "_ret");
+        auto *eax_ptr = bldr.CreateConstGEP1_32(i8Ty, E.state, kEAXOffset, "extern_eax_ptr");
+        bldr.CreateStore(res, eax_ptr, false);
+    }
+
     if (block.is_terminal())
     {
         auto *ret_val = bldr.CreateLoad(i32Ty, E.ret_ptr, E.return_reg_name.str() + "_out");
@@ -1571,6 +1727,26 @@ void LiftingContext::emit_block(const DevirtEmit &E, const VmBlock &block, llvm:
                 auto *word = bldr.CreateLoad(i32Ty, src, "snapshot_stack_word");
                 auto *dst  = bldr.CreateConstGEP2_32(stackTy, stack_g, 0, i, "snapshot_stack_dst");
                 bldr.CreateStore(word, dst, false);
+            }
+
+            // On VMEXIT, we do not need the VSP window but the ESP, because it exxecutes a stack pivot to restore
+            if (follow_vmexit)
+            {
+            auto *esp_stack_g = get_or_create_global(E.target, "__vmp_snapshot_esp_stack", stackTy);
+            auto *esp_base_g  = get_or_create_global(E.target, "__vmp_snapshot_esp_base", i32Ty);
+            auto *esp_ptr     = bldr.CreateConstGEP1_32(i8Ty, E.state, kESPOffset, "snapshot_esp_ptr");
+            auto *esp_val     = bldr.CreateLoad(i32Ty, esp_ptr, "snapshot_esp");
+            auto *esp_base    = bldr.CreateSub(esp_val, llvm::ConstantInt::get(i32Ty, kVmpStackWindowRadius), "snapshot_esp_base");
+            bldr.CreateStore(esp_base, esp_base_g, false);
+            for (uint32_t i = 0; i < kVmpStackWindowBytes; i += 4)
+            {
+                auto *addr = bldr.CreateAdd(esp_base, llvm::ConstantInt::get(i32Ty, i), "snapshot_esp_stack_addr");
+                auto *off  = bldr.CreateSub(addr, vm.base, "snapshot_esp_stack_off");
+                auto *src  = bldr.CreateGEP(i8Ty, mem, off, "snapshot_esp_stack_src");
+                auto *word = bldr.CreateLoad(i32Ty, src, "snapshot_esp_stack_word");
+                auto *dst  = bldr.CreateConstGEP2_32(stackTy, esp_stack_g, 0, i, "snapshot_esp_stack_dst");
+                bldr.CreateStore(word, dst, false);
+            }
             }
         }
         bldr.CreateRet(ret_val);
@@ -1698,7 +1874,14 @@ llvm::Function *LiftingContext::build_devirt(
 
     // Setup initial stack snapshot if supplied (for handler discovery)
     if (initial_snapshot && initial_snapshot->stack.size() == kVmpStackWindowBytes)
+    {
         seed_window(b, unknown_byte_g, vmem, initial_snapshot->stack_base, initial_snapshot->stack, 0, kVmpStackWindowBytes);
+        // Also seed the ESP-centered window (only on the multiple VMs path)
+        if (follow_vmexit && initial_snapshot->esp_stack.size() == kVmpStackWindowBytes &&
+            initial_snapshot->esp_stack_base)
+            seed_window(b, unknown_byte_g, vmem, initial_snapshot->esp_stack_base, initial_snapshot->esp_stack, 0,
+                        kVmpStackWindowBytes);
+    }
     else
     {
         auto *ret_addr_ptr = b.CreateConstGEP1_32(i8Ty, vmem, kSyntheticEsp, "return_address_ptr");
@@ -1754,7 +1937,8 @@ bool LiftingContext::discover_block(
             std::cout << "[*] Potential VMEXIT at 0x" << std::hex << current_addr << std::dec << "\n";
 
         unsigned discovery_step       = step_counter;
-        bool     used_cached_snapshot = cached_snapshot && discovery_step >= 4; // fully build first 4 steps, need a full VMENTER for the snapshot
+        bool     used_cached_snapshot = cached_snapshot && cached_snapshot->stack_base != 0 &&
+                                        discovery_step >= 4; // fully build first 4 steps, need a full VMENTER for the snapshot
 
         // Build prefix function: builds the current handler either from a snapshot or as a full prefix from the entry to recover next handler (EIP)
         auto build_prefix = [&](llvm::StringRef fn_name) -> llvm::Function *
@@ -1830,8 +2014,34 @@ bool LiftingContext::discover_block(
 
             if (is_vmexit_restore)
             {
-                // Lift the result-finalizer stub the restore handler returns int and then end the block at the VM exit
-                if (next != 0 && original_memory.count(next))
+                // Resolve the call the VM exits to from the exit EIP: if not dumped from memory its an original thunk
+                std::optional<ExternalCall> ext = follow_vmexit ? resolve_external_call(pe_info, next) : std::nullopt;
+                if (follow_vmexit)
+                {
+                    std::cout << "[*] follow-vmexit @0x" << std::hex << current_addr << ": EIP=0x" << next;
+                    if (ext)
+                        std::cout << "  -> call " << (ext->dll.empty() ? "" : ext->dll + "!")
+                                  << (ext->by_ordinal ? ("#" + std::to_string(ext->ordinal)) : ext->symbol);
+                    std::cout << std::dec << "\n";
+                }
+                if (ext)
+                    block.external_call = ext;  // opaque (imports + internal both)
+
+                // Continue to next VM if supplied, else exit
+                if (follow_vmexit && continue_cursor < continue_vmentries.size())
+                {
+                    uint64_t next_vm = continue_vmentries[continue_cursor++];
+                    std::cout << "[*] follow-vmexit: continuing at next VM 0x" << std::hex << next_vm << std::dec
+                              << " (" << continue_cursor << "/" << continue_vmentries.size() << ")\n";
+                    // Patch this VM entry's non-returning dispatcher call now (doing it earlier breaks discovery)
+                    unsigned patched = 0;
+                    patched_memory = patch_nonreturn_vmentry_calls(patched_memory, next_vm, &patched);
+                    block.next = std::make_unique<VmBlock>();
+                    return discover_block(*block.next, next_vm, {}, std::nullopt, std::nullopt);
+                }
+
+                // Terminal VM exit
+                if (!ext && next != 0 && original_memory.count(next))
                 {
                     std::cout << "[*] VMEXIT: lifting result-finalizer stub 0x" << std::hex << next << std::dec
                               << "\n";
@@ -1881,6 +2091,26 @@ bool LiftingContext::discover_block(
         }
 
         // if Kind::Unknown
+        if (is_vmexit_restore && follow_vmexit)
+        {
+            if (continue_cursor < continue_vmentries.size())
+            {
+                // The exit EIP didn't fold to a call target, so emit no external call so just resume at the next queued VM.
+                uint64_t next_vm = continue_vmentries[continue_cursor++];
+                std::cout << "[*] follow-vmexit @0x" << std::hex << current_addr
+                          << ": exit target unresolved; continuing at next VM 0x" << next_vm << std::dec
+                          << " (" << continue_cursor << "/" << continue_vmentries.size() << ")\n";
+                unsigned patched = 0;
+                patched_memory = patch_nonreturn_vmentry_calls(patched_memory, next_vm, &patched);
+                block.next = std::make_unique<VmBlock>();
+                return discover_block(*block.next, next_vm, {}, std::nullopt, std::nullopt);
+            }
+            std::cout << "[*] follow-vmexit @0x" << std::hex << current_addr
+                      << ": terminal VM exit (no further continuation)" << std::dec << "\n";
+            block.at_vmexit = true;
+            return true;
+        }
+
         std::cout << "[!] Could not calculate next handler after 0x" << std::hex << current_addr
                   << std::dec << "\n";
         return false;
@@ -1889,7 +2119,7 @@ bool LiftingContext::discover_block(
     return false;
 }
 
-std::unique_ptr<llvm::Module> LiftingContext::execute(llvm::ArrayRef<uint64_t> replay_handlers)
+std::unique_ptr<llvm::Module> LiftingContext::execute()
 {
     // Setup remill intrinsics and normalize functions
     setup_remill_intrinsics(*sem_module);
@@ -1898,32 +2128,11 @@ std::unique_ptr<llvm::Module> LiftingContext::execute(llvm::ArrayRef<uint64_t> r
     stub_and_inline_flag_compare_helpers(*sem_module);
 
     // -----------------------------------------------------------------------
-    // Build root VmBlock
+    // Discovery: lift handlers one by one starting at the VMENTER and fork on
+    // branch, following VMEXITs into the continuation VMs when --continue is set.
     auto root_block = std::make_unique<VmBlock>();
-    bool recovered_to_vmexit = false;
-
-    // Replay mode - build a flat linear VmBlock from the replay list
-    if (!replay_handlers.empty())
-    {
-        std::vector<uint64_t> replay_trace;
-        if (replay_handlers.front() != trace.vmenter)
-            replay_trace.push_back(trace.vmenter);
-        replay_trace.insert(replay_trace.end(), replay_handlers.begin(), replay_handlers.end());
-
-        std::cout << "[*] Replaying " << std::dec << replay_trace.size() << " trace entries; skipping discovery\n";
-        for (uint64_t addr : replay_trace)
-            lift_handler(addr);
-
-        root_block->handlers  = replay_trace;
-        root_block->at_vmexit = true;
-        recovered_to_vmexit   = true;
-    }
-    else
-    {
-        // Discovery mode - lift handlers one by one and fork on branch
-        std::cout << "[*] Starting handler discovery at 0x" << std::hex << trace.vmenter << std::dec << "\n";
-        recovered_to_vmexit = discover_block(*root_block, trace.vmenter, {}, std::nullopt, std::nullopt);
-    }
+    std::cout << "[*] Starting handler discovery at 0x" << std::hex << trace.vmenter << std::dec << "\n";
+    bool recovered_to_vmexit = discover_block(*root_block, trace.vmenter, {}, std::nullopt, std::nullopt);
 
     if (!recovered_to_vmexit)
         std::cerr << "[!] Failed to recover a complete trace to VMEXIT; emitting partially devirtualized IR\n";
@@ -2103,6 +2312,19 @@ std::unique_ptr<llvm::Module> LiftingContext::execute(llvm::ArrayRef<uint64_t> r
     // Final optimization
     helpers::run_default_o3_pipeline(*out_module);
     run_strip_rdtsc_sideeffects(*out_module);
+
+    // Now that the probed argument slots have folded to constants/SSA values,
+    // recover the real argument count of inferred (varargs) external calls.
+    if (auto *devirt_fn = out_module->getFunction("devirt"))
+    {
+        unsigned trimmed = trim_inferred_call_args(*devirt_fn, pe_info);
+        if (trimmed)
+        {
+            std::cout << "[*] Recovered argument count of " << std::dec << trimmed
+                      << " inferred external call(s)\n";
+            helpers::run_default_o3_pipeline(*out_module);  // clean up now-dead arg loads
+        }
+    }
     if (save_intermediate)
         dump_module_snapshot(*out_module, "out.after_final_o3.ll");
 
@@ -2123,8 +2345,8 @@ std::unique_ptr<llvm::Module> LiftingContext::execute(llvm::ArrayRef<uint64_t> r
 //==---------------------------------------------------------------------------==//
 
 LiftResult VmpLifter::run(
-    const Memory &memory, VmpTrace trace, std::optional<unsigned> param_count, bool save_intermediate,
-    llvm::ArrayRef<uint64_t> replay_handlers
+    const Memory &memory, const PEInfo &pe_info, VmpTrace trace, std::optional<unsigned> param_count,
+    bool save_intermediate, llvm::ArrayRef<uint64_t> continue_vmentries
 )
 {
     auto  ctx_owned = std::make_unique<llvm::LLVMContext>();
@@ -2143,7 +2365,10 @@ LiftResult VmpLifter::run(
     // ---------------------------------------------------------------
     // Normalization 
     
-    // Normalize VMENTRY wrapper calls so it doesn't fall through into junk code
+    // Normalize VMENTRY wrapper calls so it doesn't fall through into junk code.
+    // Continuation VM entries (--continue) are patched lazily in discover_block,
+    // just before each is discovered, so the patch (which rewrites shared post-call
+    // bytes) cannot corrupt handlers already lifted/cached from earlier VMs.
     unsigned patched_vmentry_calls = 0;
     auto     call_patched_memory = patch_nonreturn_vmentry_calls(memory, trace.vmenter, &patched_vmentry_calls);
     uint32_t host_return_address = 0;
@@ -2176,11 +2401,12 @@ LiftResult VmpLifter::run(
     // Lifting
     
     LiftingContext lifting_context(
-        ctx, memory, std::move(arch), std::move(sem_module), std::move(patched_memory),
+        ctx, memory, pe_info, std::move(arch), std::move(sem_module), std::move(patched_memory),
         std::move(vm), trace, resolved_param_count, save_intermediate,
+        std::vector<uint64_t>(continue_vmentries.begin(), continue_vmentries.end()),
         host_return_address, std::move(host_reg_bindings)
     );
 
-    auto out_module = lifting_context.execute(replay_handlers);
+    auto out_module = lifting_context.execute();
     return LiftResult{std::move(ctx_owned), std::move(out_module)};
 }
