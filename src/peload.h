@@ -53,7 +53,6 @@ void RebaseMemory(Memory &memory, uint64_t old_base, uint64_t new_base);
 // All take/return absolute VAs in the *current* info.image_base.
 const PESection *SectionOf(const PEInfo &info, uint64_t addr);
 bool             IsInVmpSection(const PEInfo &info, uint64_t addr);  // section name starts ".vmp"
-const PEImport  *ImportAtSlot(const PEInfo &info, uint64_t slot_va);
 // Resolve a raw original-thunk value (e.g. a VMEXIT EIP that the VM computed) to
 // its import. Tries the value as-is and masked to the low 31 bits (name RVA).
 const PEImport  *ImportByThunk(const PEInfo &info, uint32_t thunk_value);

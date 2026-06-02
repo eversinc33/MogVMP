@@ -318,14 +318,6 @@ bool IsInVmpSection(const PEInfo &info, uint64_t addr)
     return s && s->name.rfind(".vmp", 0) == 0;
 }
 
-const PEImport *ImportAtSlot(const PEInfo &info, uint64_t slot_va)
-{
-    if (slot_va < info.image_base)
-        return nullptr;
-    auto it = info.import_by_slot_rva.find(static_cast<uint32_t>(slot_va - info.image_base));
-    return it == info.import_by_slot_rva.end() ? nullptr : &it->second;
-}
-
 const PEImport *ImportByThunk(const PEInfo &info, uint32_t thunk_value)
 {
     auto it = info.import_by_orig_thunk.find(thunk_value);

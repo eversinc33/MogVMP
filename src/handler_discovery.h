@@ -42,8 +42,8 @@ struct PrefixSnapshot
 
     // ESP-centered window, needed at a VMEXIT where the VM stack pointer (ESI) is
     // restored to a non-constant native value but ESP (and the native return
-    // addresses on it) is concrete.
-    uint32_t esp = 0;
+    // addresses / pushed call target on the pivoted frame) is concrete. Seeded back
+    // by build_devirt so the exit fast-path can read the call target.
     uint32_t esp_stack_base = 0;  // base VA of the ESP-centered window (0 if absent)
     std::vector<std::optional<uint8_t>> esp_stack;
 };

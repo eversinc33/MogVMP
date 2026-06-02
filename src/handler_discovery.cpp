@@ -84,7 +84,6 @@ static std::optional<PrefixSnapshot> extract_prefix_snapshot(llvm::Function &fn)
 
     auto *esp_stack_g = module->getGlobalVariable("__vmp_snapshot_esp_stack");
     auto *esp_base_g  = module->getGlobalVariable("__vmp_snapshot_esp_base");
-    auto *esp_val_g   = module->getGlobalVariable("__vmp_snapshot_esp");
 
     PrefixSnapshot snap;
     snap.state.assign(4096, std::nullopt);
@@ -158,12 +157,6 @@ static std::optional<PrefixSnapshot> extract_prefix_snapshot(llvm::Function &fn)
             {
                 if (auto v = constant_i32(si->getValueOperand()))
                     snap.esp_stack_base = *v;
-                continue;
-            }
-            if (esp_val_g && ptr->stripPointerCasts() == esp_val_g)
-            {
-                if (auto v = constant_i32(si->getValueOperand()))
-                    snap.esp = *v;
                 continue;
             }
         }

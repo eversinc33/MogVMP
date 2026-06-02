@@ -72,8 +72,17 @@ struct ExternalCall
     bool        by_ordinal = false;
     uint32_t    thunk = 0;    // import: original-thunk value; internal: the code VA
     unsigned    argc = 0;     // stack args to read at the call site (0 = none)
-    bool        internal = false;  // true => `thunk` is an in-image code VA to lift
+    bool        internal = false;  // true => `thunk` is an in-image code VA
+    // True => argc is a provisional upper bound; the real count is recovered after
+    // concretization by trim_inferred_call_args (the call is emitted as varargs so
+    // it can be re-pointed to fewer args). Used for internal targets whose signature
+    // we don't know (e.g. a CRT swprintf wrapper reached via VMEXIT).
+    bool        infer_argc = false;
 };
+
+// How many stack slots to read for an infer_argc call before trimming. Generous;
+// the trim pass discards the leftover tail past the real argument list.
+constexpr unsigned kInferArgcProbe = 8;
 
 // Known stdcall arg counts for common imports, so args are recovered without a
 // user-supplied count. Extend as needed.
@@ -102,9 +111,11 @@ static std::optional<ExternalCall> resolve_external_call(const PEInfo &pe_info, 
         char buf[24];
         std::snprintf(buf, sizeof buf, "sub_%X", target);
         ExternalCall ec;
-        ec.symbol   = buf;
-        ec.thunk    = target;
-        ec.internal = true;  // real code in the image -> lift it instead of stubbing
+        ec.symbol     = buf;
+        ec.thunk      = target;
+        ec.internal   = true;  // real in-image code -> opaque call, args recovered
+        ec.infer_argc = true;
+        ec.argc       = kInferArgcProbe;
         return ec;
     }
     return std::nullopt;
@@ -582,6 +593,64 @@ static unsigned erase_unused_undefined8_calls(llvm::Module &module)
         fn->eraseFromParent();
 
     return unused.size();
+}
+
+// Recover the real argument count of infer_argc external calls (emitted as
+// varargs with a provisional upper bound of kInferArgcProbe slots) and rebuild
+// each call with just the genuine arguments.
+//
+// A VMEXIT-to-call leaves the pushed arguments contiguous just above the return
+// address at [ESP+4 ..]; the slots beyond them are the caller's existing frame,
+// which begins with a saved return address (a pointer into an executable image
+// section). After concretization every probed slot has folded to a constant or a
+// computed SSA value, so the boundary is the first constant operand (past the
+// first) that points into an executable section. That return-address sentinel is
+// the end of the argument list (rwx9's "stack slots with reaching defs": only the
+// freshly-pushed slots are arguments).
+static unsigned trim_inferred_call_args(llvm::Function &fn, const PEInfo &pe_info)
+{
+    auto is_exec_ptr = [&pe_info](llvm::Value *v) -> bool
+    {
+        auto *ci = llvm::dyn_cast<llvm::ConstantInt>(v);
+        if (!ci)
+            return false;
+        const PESection *s = peload::SectionOf(pe_info, ci->getZExtValue());
+        return s && (s->characteristics & 0x20000000u);  // IMAGE_SCN_MEM_EXECUTE
+    };
+
+    llvm::SmallVector<llvm::CallInst *, 8> targets;
+    for (auto &bb : fn)
+        for (auto &inst : bb)
+            if (auto *ci = llvm::dyn_cast<llvm::CallInst>(&inst))
+                if (auto *callee = ci->getCalledFunction();
+                    callee && callee->isDeclaration() && callee->isVarArg() && ci->arg_size() > 0)
+                    targets.push_back(ci);
+
+    unsigned trimmed = 0;
+    for (auto *ci : targets)
+    {
+        unsigned argc = ci->arg_size();
+        for (unsigned i = 1; i < ci->arg_size(); ++i)
+            if (is_exec_ptr(ci->getArgOperand(i)))
+            {
+                argc = i;  // saved return address -> end of the argument list
+                break;
+            }
+        if (argc == ci->arg_size())
+            continue;
+
+        std::vector<llvm::Value *> args;
+        for (unsigned i = 0; i < argc; ++i) args.push_back(ci->getArgOperand(i));
+        llvm::IRBuilder<> bldr(ci);
+        auto *repl = bldr.CreateCall(ci->getCalledFunction(), args);
+        repl->setTailCall(ci->isTailCall());
+        if (!ci->use_empty())
+            ci->replaceAllUsesWith(repl);
+        repl->takeName(ci);
+        ci->eraseFromParent();
+        ++trimmed;
+    }
+    return trimmed;
 }
 
 static void neutralize_dispatch_intrinsics(llvm::Module &module)
@@ -1633,7 +1702,12 @@ void LiftingContext::emit_block(const DevirtEmit &E, const VmBlock &block, llvm:
             }
         }
 
-        auto *fnTy   = llvm::FunctionType::get(i32Ty, arg_tys, false);
+        // infer_argc calls are declared varargs with NO fixed params (i32(...)), so
+        // trim_inferred_call_args can later rebuild the call with the recovered
+        // (smaller) argument count against the same declaration without a fixed-param
+        // count mismatch.
+        auto *fnTy   = ec.infer_argc ? llvm::FunctionType::get(i32Ty, {}, /*isVarArg=*/true)
+                                     : llvm::FunctionType::get(i32Ty, arg_tys, /*isVarArg=*/false);
         auto  callee = E.target.getOrInsertFunction(callee_name, fnTy);
         auto *res    = bldr.CreateCall(callee, args, callee_name + "_ret");
         auto *eax_ptr = bldr.CreateConstGEP1_32(i8Ty, E.state, kEAXOffset, "extern_eax_ptr");
@@ -1675,16 +1749,14 @@ void LiftingContext::emit_block(const DevirtEmit &E, const VmBlock &block, llvm:
                 bldr.CreateStore(word, dst, false);
             }
 
-            // ESP-centered window + ESP itself. At a VMEXIT the VSP window above is
-            // unusable (ESI restored to a native value), but ESP and the native
-            // return addresses on the stack are concrete; this is what follow-vmexit
-            // reads to recover the next-VM entry below the pushed external-call addr.
+            // ESP-centered window. At a VMEXIT the VSP window above is unusable (ESI
+            // restored to a native value), but ESP and the pivoted frame it points at
+            // (pushed call target / return addresses) are concrete; build_devirt seeds
+            // this window back so the exit fast-path can read the call target.
             auto *esp_stack_g = get_or_create_global(E.target, "__vmp_snapshot_esp_stack", stackTy);
             auto *esp_base_g  = get_or_create_global(E.target, "__vmp_snapshot_esp_base", i32Ty);
-            auto *esp_val_g   = get_or_create_global(E.target, "__vmp_snapshot_esp", i32Ty);
             auto *esp_ptr     = bldr.CreateConstGEP1_32(i8Ty, E.state, kESPOffset, "snapshot_esp_ptr");
             auto *esp_val     = bldr.CreateLoad(i32Ty, esp_ptr, "snapshot_esp");
-            bldr.CreateStore(esp_val, esp_val_g, false);
             auto *esp_base    = bldr.CreateSub(esp_val, llvm::ConstantInt::get(i32Ty, kVmpStackWindowRadius), "snapshot_esp_base");
             bldr.CreateStore(esp_base, esp_base_g, false);
             for (uint32_t i = 0; i < kVmpStackWindowBytes; i += 4)
@@ -1986,17 +2058,8 @@ bool LiftingContext::discover_block(
                                   << (ext->by_ordinal ? ("#" + std::to_string(ext->ordinal)) : ext->symbol);
                     std::cout << std::dec << "\n";
                 }
-                if (ext && ext->internal)
-                {
-                    // In-image target: lift its real code and emit it like a handler
-                    // (it reads its own stack args) rather than an opaque declaration.
-                    std::cout << "[*] follow-vmexit: lifting internal call target 0x" << std::hex << ext->thunk
-                              << std::dec << "\n";
-                    lift_handler(ext->thunk);
-                    block.handlers.push_back(ext->thunk);
-                }
-                else if (ext)
-                    block.external_call = ext;
+                if (ext)
+                    block.external_call = ext;  // opaque (imports + internal both)
 
                 // Chain into the next queued VM if one is supplied; otherwise this is
                 // the terminal exit (the external call, if any, is still emitted).
@@ -2082,21 +2145,19 @@ bool LiftingContext::discover_block(
                 {
                     ext = resolve_external_call(pe_info, static_cast<uint32_t>(entry.call_target));
                     if (ext && entry.call_argc)
-                        ext->argc = entry.call_argc;
+                    {
+                        ext->argc       = entry.call_argc;  // explicit override wins
+                        ext->infer_argc = false;
+                    }
                 }
                 std::cout << "[*] follow-vmexit @0x" << std::hex << current_addr
                           << ": exit target unresolved; continuing at next VM 0x" << entry.reentry << std::dec
                           << " (" << continue_cursor << "/" << continue_vmentries.size() << ")";
                 if (ext)
-                    std::cout << " [call " << ext->symbol << (ext->internal ? " (lifted)" : "") << "]";
+                    std::cout << " [call " << ext->symbol << (ext->internal ? " (internal)" : "") << "]";
                 std::cout << "\n";
-                if (ext && ext->internal)
-                {
-                    lift_handler(ext->thunk);
-                    block.handlers.push_back(ext->thunk);
-                }
-                else if (ext)
-                    block.external_call = ext;
+                if (ext)
+                    block.external_call = ext;  // opaque (imports + internal both)
                 unsigned patched = 0;
                 patched_memory = patch_nonreturn_vmentry_calls(patched_memory, entry.reentry, &patched);
                 block.next = std::make_unique<VmBlock>();
@@ -2341,6 +2402,19 @@ std::unique_ptr<llvm::Module> LiftingContext::execute(llvm::ArrayRef<uint64_t> r
     // Final optimization
     helpers::run_default_o3_pipeline(*out_module);
     run_strip_rdtsc_sideeffects(*out_module);
+
+    // Now that the probed argument slots have folded to constants/SSA values,
+    // recover the real argument count of inferred (varargs) external calls.
+    if (auto *devirt_fn = out_module->getFunction("devirt"))
+    {
+        unsigned trimmed = trim_inferred_call_args(*devirt_fn, pe_info);
+        if (trimmed)
+        {
+            std::cout << "[*] Recovered argument count of " << std::dec << trimmed
+                      << " inferred external call(s)\n";
+            helpers::run_default_o3_pipeline(*out_module);  // clean up now-dead arg loads
+        }
+    }
     if (save_intermediate)
         dump_module_snapshot(*out_module, "out.after_final_o3.ll");
 
