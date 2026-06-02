@@ -33,11 +33,11 @@ Branching example:
 Run the binary on the target executable, witha VMENTER address and an output path:
 
 ```sh
-  lifter [--save-intermediate-steps] [--continue <vmentry,...>] [--args <count>] --vmenter <0xADDR> [--imagebase <0xADDR>] <pe> <out.ll>
+lifter [--save-intermediate-steps] [--continue <vmentry,...>] [--args <count>] --vmenter <0xADDR> [--imagebase <0xADDR>] <pe> <out.ll>
 # e.g. for a simple example
-./build/lifter --vmenter 0x004040ED ./tests/data/Project1.vmp.exe out.ll
+lifter --vmenter 0x004040ED ./tests/data/Project1.vmp.exe out.ll
 # function with multiple VMs
-./build/lifter --vmenter 0x0040C890 --continue 0x4312d7,0x41F618 ./tests/data/devirtualizeme32_vmp_3.0.9_v1.exe devirt.ll
+lifter --vmenter 0x0040C890 --continue 0x4312d7,0x41F618 ./tests/data/devirtualizeme32_vmp_3.0.9_v1.exe devirt.ll
 ```
 
 - `--vmenter <0xADDR>` - address of the VMENTER to lift
