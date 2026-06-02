@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -106,6 +107,8 @@ int main(int argc, char *argv[])
 {
     // Args
     bool                        save_intermediate = false;
+    bool                        follow_vmexit = false;
+    std::vector<ContinueEntry>  continue_vmentries;
     unsigned                    param_count = 0;
     bool                        have_param_count = false;
     VmpTrace                    trace;
@@ -121,6 +124,54 @@ int main(int argc, char *argv[])
         if (arg == "--save-intermediate-steps")
         {
             save_intermediate = true;
+        }
+        else if (arg == "--follow-vmexit")
+        {
+            follow_vmexit = true;
+        }
+        else if (arg == "--continue")
+        {
+            if (++i >= argc)
+            {
+                std::cerr << "Missing comma-separated address list after --continue\n";
+                return 1;
+            }
+            std::string        list(argv[i]);
+            std::string        token;
+            std::istringstream ss(list);
+            while (std::getline(ss, token, ','))
+            {
+                size_t b = token.find_first_not_of(" \t");
+                size_t e = token.find_last_not_of(" \t");
+                if (b == std::string::npos)
+                    continue;
+                token = token.substr(b, e - b + 1);
+
+                // Optional "call[/argc]@reentry": before '@' is the explicit exit call
+                // target (for base+RVA targets that don't fold), with an optional
+                // "/argc" stack-arg count; after '@' is the re-entry vmentry.
+                ContinueEntry entry;
+                size_t        at = token.find('@');
+                std::string   reentry_str = token;
+                if (at != std::string::npos)
+                {
+                    std::string call_str = token.substr(0, at);
+                    reentry_str          = token.substr(at + 1);
+                    size_t slash = call_str.find('/');
+                    if (slash != std::string::npos)
+                    {
+                        if (!parse_unsigned_arg(call_str.substr(slash + 1), "--continue call argc", entry.call_argc))
+                            return 1;
+                        call_str = call_str.substr(0, slash);
+                    }
+                    if (!parse_u64_arg(call_str, "--continue call target", entry.call_target))
+                        return 1;
+                }
+                if (!parse_u64_arg(reentry_str, "--continue reentry", entry.reentry))
+                    return 1;
+                continue_vmentries.push_back(entry);
+            }
+            follow_vmexit = true;  // --continue implies following VMEXITs
         }
         else if (arg == "--args")
         {
@@ -158,7 +209,8 @@ int main(int argc, char *argv[])
     if (positional.size() != 2 || !have_vmenter)
     {
         std::cerr << "Usage: " << argv[0]
-                  << " [--save-intermediate-steps] [--replay <handlers.txt>]"
+                  << " [--save-intermediate-steps] [--follow-vmexit] [--continue <[call@]reentry,...>]"
+                     " [--replay <handlers.txt>]"
                      " [--args <count>] --vmenter <0xADDR> [--imagebase <0xADDR>] <pe_file> <output.ll>\n"
                   << "  e.g. " << argv[0] << " --args 2 --vmenter 0x401000 vmp.exe lifted.ll\n"
                   << "  --args is optional; when omitted, argc is inferred from the stack pushes.\n";
@@ -198,7 +250,8 @@ int main(int argc, char *argv[])
     std::optional<unsigned> param_count_opt;
     if (have_param_count)
         param_count_opt = param_count;
-    auto result = VmpLifter{}.run(memory, trace, param_count_opt, save_intermediate, replay_handlers);
+    auto result = VmpLifter{}.run(memory, info, trace, param_count_opt, save_intermediate, follow_vmexit,
+                                  continue_vmentries, replay_handlers);
     if (!result)
         return 1;
 

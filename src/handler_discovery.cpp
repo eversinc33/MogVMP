@@ -13,6 +13,7 @@
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -81,9 +82,14 @@ static std::optional<PrefixSnapshot> extract_prefix_snapshot(llvm::Function &fn)
     if (!state_g || !stack_g || !base_g)
         return std::nullopt;
 
+    auto *esp_stack_g = module->getGlobalVariable("__vmp_snapshot_esp_stack");
+    auto *esp_base_g  = module->getGlobalVariable("__vmp_snapshot_esp_base");
+    auto *esp_val_g   = module->getGlobalVariable("__vmp_snapshot_esp");
+
     PrefixSnapshot snap;
     snap.state.assign(4096, std::nullopt);
     snap.stack.assign(512, std::nullopt);
+    snap.esp_stack.assign(512, std::nullopt);
     bool saw_any = false;
 
     // The snapshot windows are captured as i32 word stores (see build_devirt):
@@ -136,11 +142,38 @@ static std::optional<PrefixSnapshot> extract_prefix_snapshot(llvm::Function &fn)
                     snap.stack_base = *v;
                     saw_any = true;
                 }
+                continue;
+            }
+            if (esp_stack_g)
+                if (auto off = constant_offset_from_global(ptr, esp_stack_g))
+                {
+                    if (*off < snap.esp_stack.size())
+                    {
+                        record_word(snap.esp_stack, *off, si);
+                        saw_any = true;
+                    }
+                    continue;
+                }
+            if (esp_base_g && ptr->stripPointerCasts() == esp_base_g)
+            {
+                if (auto v = constant_i32(si->getValueOperand()))
+                    snap.esp_stack_base = *v;
+                continue;
+            }
+            if (esp_val_g && ptr->stripPointerCasts() == esp_val_g)
+            {
+                if (auto v = constant_i32(si->getValueOperand()))
+                    snap.esp = *v;
+                continue;
             }
         }
     }
 
-    if (!saw_any || !snap.stack_base)
+    // Keep the snapshot when any window produced data. The VSP window may be empty
+    // at a VMEXIT (ESI restored to a non-constant native value) while the
+    // ESP-centered window is still concrete; callers gate VSP-seeded fast paths on
+    // stack_base != 0 separately.
+    if (!saw_any)
         return std::nullopt;
     return snap;
 }
@@ -682,7 +715,8 @@ std::optional<VmpBranchInfo> detect_vmp_branch(llvm::Function &fn, const Memory 
 PrefixResult DiscoveryEngine::run_step(
     const PrefixDiscoveryBuilder           &build_prefix,
     std::optional<std::pair<unsigned, bool>> forced_branch_condition,
-    bool                                     full_concretize
+    bool                                     full_concretize,
+    bool                                     dump_probe
 )
 {
     unsigned          step = step_counter_++;
@@ -694,6 +728,8 @@ PrefixResult DiscoveryEngine::run_step(
              forced_branch_condition, full_concretize);
     if (save_intermediate_)
         dump_function_snapshot(*fn, "out.prefix." + std::to_string(step) + ".after.ll");
+    else if (dump_probe && std::getenv("VMP_DUMP_VMEXIT"))
+        dump_function_snapshot(*fn, "out.vmexit." + std::to_string(step) + ".after.ll");
 
     if (auto c = get_constant_i32_return(*fn))
     {
