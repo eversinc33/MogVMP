@@ -9,9 +9,10 @@ MogVMP lifts code to LLVM using [Remill](https://github.com/lifting-bits/remill)
 
 For recovery of the CFG, the main goal of this project was to have it work fully statically, without needing any opcode traces or merging CFGs from traced runs. Instead, opcode handlers are lifted and optimized incrementally from VMENTER on. After each lifted handler, the next handler materializes as a constant. If it doesn't, VMP is branching: in this case, the two possible targets are extracted and the lifting process is forked. This approach works well on CFGs without jumptables, with a caveat of being rather slow. 
 
-MogVMP runs on unpacked binaries and only attacks the virtualization of VMProtect. If a function uses multiple VMs, e.g. if it calls out to external APIs, you need to supply them to the commandline as well.
+MogVMP runs on unpacked binaries and only attacks the virtualization of VMProtect. If a function uses multiple VMs, e.g. if it calls out to external APIs, you need to supply them to the commandline as well. The goal is not re-compilation but readable LLVM IR. In simple cases functions can be recompiled without change. In other cases, e.g. with external calls or argument buffers, manual adjustments to the IR are needed. 
 
-That being said, **MogVMP is a PoC I created to learn Remill** - do not expect production quality, handling of edge-cases, clean code or even that it works reliably beyond the complexity of the test examples. Theres issues and work in progress. See the examples below for what can be lifted already.
+That being said, **MogVMP is a PoC I created to learn Remill** - do not expect production quality, handling of edge-cases, clean code or even that it works reliably beyond the complexity of the test examples. Theres issues and work in progress. See the examples below for what can be lifted already. 
+
  
 ## Examples
 
